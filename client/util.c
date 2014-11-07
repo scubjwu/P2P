@@ -8,6 +8,14 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <string.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+
+#define IPV4_ADDR_LEN	16
 
 char *cmd_system(const char *cmd)
 {
@@ -139,21 +147,101 @@ bool check_pidfile(char *name)
 	return true;
 }
 
+//get all the interfaces' ip address
+int getlocalip(char outip[][IPV4_ADDR_LEN])
+{
+	int i = 0, res = -1, n = 0;
+	int sockfd;
+	struct ifconf ifconf;
+	char buf[512];
+	struct ifreq *ifreq;
+	char* ip;
+
+	ifconf.ifc_len = sizeof(buf);
+	ifconf.ifc_buf = buf;
+
+	if((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+		return -1;
+
+	ioctl(sockfd, SIOCGIFCONF, &ifconf);
+	close(sockfd);
+
+	ifreq = (struct ifreq *)buf;
+	for(i=(ifconf.ifc_len/sizeof(struct ifreq)); i>0; i--)
+	{
+		ip = inet_ntoa(((struct sockaddr_in*)&(ifreq->ifr_addr))->sin_addr);
+		ifreq++;
+		
+		if(strcmp(ip, "127.0.0.1")==0)
+			continue;
+
+		strcpy(outip[n++],ip);
+		res = n;
+	}
+
+	return res;
+}
+
+unsigned int BKDRHash(char *str)
+{
+	unsigned int seed = 131;
+	unsigned int hash = 0;
+
+	while(*str)
+		hash = hash * seed + (*str++);
+
+	return (hash & 0x7FFFFFFF);
+}
+
+//use MAC addr to generate client ID
+unsigned int getclientID(void)
+{
+    int fd, interface;
+    struct ifreq buf[16];
+    struct ifconf ifc;
+    char mac[32] = {0};
+
+    if((fd = socket(AF_INET, SOCK_DGRAM, 0)) >= 0)
+    {
+        int i = 0;
+        ifc.ifc_len = sizeof(buf);
+        ifc.ifc_buf = (caddr_t)buf;
+        if (!ioctl(fd, SIOCGIFCONF, (char *)&ifc))
+        {
+            interface = ifc.ifc_len / sizeof(struct ifreq);
+            while (i < interface)
+            {
+                if (!(ioctl(fd, SIOCGIFHWADDR, (char *)&buf[i])))
+                {
+                    sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[0],
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[1],
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[2],
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[3],
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[4],
+                        (unsigned char)buf[i].ifr_hwaddr.sa_data[5]);
+		    
+		    if(strcmp(mac, "00:00:00:00:00:00")) {
+			close(fd);
+			return BKDRHash(mac);
+		    }
+                }
+                i++;
+            }
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
 
 /*
 //test
 int main(void)
 {
-	if(check_pidfile("test") == false) {
-		printf("already running\n");
-		return -1;
-	}
+	printf("%d\n", getclientID());
 	
-	daemon(1,1);
-	
-	pidfile_create("test");
-
-	for(;;) {}
+	return 0;
 }
 */
-
