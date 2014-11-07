@@ -12,17 +12,22 @@
 char *cmd_system(const char *cmd)
 {
 #define BUFLEN	512
-	char *res = "";
 	static char buf[BUFLEN];
+	char *res = "";
+	char tmp[BUFLEN] = {0};
 	FILE *f;
-	
+
 	f = popen(cmd, "r");
-	memset(buf, 0, BUFLEN * sizeof(char));
-	while(fgets(buf, BUFLEN - 1, f) != NULL)
-		res = buf;
+	while(fgets(tmp, BUFLEN - 1, f) != NULL)
+		;
 
 	if(f != NULL)
 		pclose(f);
+
+	//delete the \n ending char
+	memset(buf, 0, BUFLEN * sizeof(char));
+	memcpy(buf, tmp, strlen(tmp) - 1);
+	res = buf;
 
 	return res;
 #undef BUFLEN
@@ -93,24 +98,13 @@ pid_t pidfile_pid(char *pidFile)
 	return 0;
 }
 
-bool pidfile_setup(char *name)
+void pidfile_create(char *name)
 {
 	int fd;
-	char buf[32] = {0};
 	char pidFile[512] = {0};
-	char rdir[512] = {0};
-	char *tmp = cmd_system("echo $HOME");
-	pid_t pid;
+	char buf[32] = {0};
 
-	memcpy(rdir, tmp, strlen(tmp) - 1);
-	sprintf(pidFile, "%s/%s.pid", rdir, name);
-
-	pid = pidfile_pid(pidFile);
-	if (pid != 0) {
-		printf("%s(pid: %d) is already running\n", name, pid);
-		return false;
-	}
-
+	sprintf(pidFile, "%s/%s.pid", cmd_system("echo $HOME"), name);
 	fd = open(pidFile, O_NONBLOCK | O_CREAT | O_WRONLY | O_EXCL, 0644);
 	if(fd == -1) {
 		perror("open");
@@ -128,19 +122,37 @@ bool pidfile_setup(char *name)
 		exit(1);
 	}
 	/* Leave pid file open & locked for the duration... */
+}
+
+bool check_pidfile(char *name)
+{
+	char pidFile[512] = {0};
+	pid_t pid;
+
+	sprintf(pidFile, "%s/%s.pid", cmd_system("echo $HOME"), name);
+	pid = pidfile_pid(pidFile);
+	if (pid != 0) {
+		printf("%s(pid: %d) is already running\n", name, pid);
+		return false;
+	}
 	
 	return true;
 }
+
 
 /*
 //test
 int main(void)
 {
-	if(pidfile_setup("test") == false) {
+	if(check_pidfile("test") == false) {
 		printf("already running\n");
 		return -1;
 	}
 	
+	daemon(1,1);
+	
+	pidfile_create("test");
+
 	for(;;) {}
 }
 */
