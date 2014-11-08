@@ -10,7 +10,7 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 
-#define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
+#include "common.h"
 
 struct
 {
@@ -38,21 +38,6 @@ struct
 #endif
 	{NULL, 0, 0, 0}
 };
-
-int set_blocking(int fd, bool set)
-{
-	int val;
-
-	if((val = fcntl(fd, F_GETFL, 0)) == -1)
-		return -1;
-		
-	if(set) /* Turn blocking on - ie. clear nonblock flag */
-		val &= ~O_NONBLOCK;
-	else
-		val |= O_NONBLOCK;
-	
-	return fcntl( fd, F_SETFL, val);
-}
 
 void set_socketopt(int fd)
 {
