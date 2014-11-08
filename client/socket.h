@@ -1,5 +1,3 @@
-#include <stdbool.h>
-
 int set_blocking(int fd, bool set);
 void set_socketopt(int fd);
 int open_unix_socket_in(char *path) ;

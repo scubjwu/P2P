@@ -1,17 +1,11 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <linux/if.h>
+#include "includes.h"
+
+#include <ev.h>
 
 #define IPV4_ADDR_LEN	16
 #define G_SRV_IP_ADDR	"10.0.0.1"
 #define G_CONFIG_FILE	"/etc/PP2P/client.config"
+#define UNIX_SOCK_PATH	"/tmp/PP2P.sock"
 	
 int SERVER_PORT = 49999;
 
@@ -23,41 +17,9 @@ int INTERFACE_ID = 1;
 char SERVER_IP[IPV4_ADDR_LEN] = G_SRV_IP_ADDR;
 char CLIENT_IP[IPV4_ADDR_LEN] = "0.0.0.0";
 char CONFIG_FILE[256] = G_CONFIG_FILE;
+char SHARE_DIR[256] = "empty";
 
-//get all the interfaces' ip address
-int getlocalip(char outip[][IPV4_ADDR_LEN])
-{
-	int i = 0, res = -1, n = 0;
-	int sockfd;
-	struct ifconf ifconf;
-	char buf[512];
-	struct ifreq *ifreq;
-	char* ip;
-
-	ifconf.ifc_len = 512;
-	ifconf.ifc_buf = buf;
-
-	if((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-		return -1;
-
-	ioctl(sockfd, SIOCGIFCONF, &ifconf);
-	close(sockfd);
-
-	ifreq = (struct ifreq *)buf;
-	for(i=(ifconf.ifc_len/sizeof(struct ifreq)); i>0; i--)
-	{
-		ip = inet_ntoa(((struct sockaddr_in*)&(ifreq->ifr_addr))->sin_addr);
-		ifreq++;
-		
-		if(strcmp(ip, "127.0.0.1")==0)
-			continue;
-
-		strcpy(outip[n++],ip);
-		res = n;
-	}
-
-	return res;
-}
+struct ev_loop *loop;
 
 void load_config_file(char *file)
 {
@@ -67,14 +29,14 @@ void load_config_file(char *file)
 		size_t len = 0;
 		ssize_t read;
 		char id[32] = {0};
-		char value[128] = {0};
+		char value[256] = {0};
 		
 		while((read = getline(&line, &len, f)) != -1) {
 			if(line[0] == '#')
 				continue;
 			
 			memset(id, 0, sizeof(char) * 32);
-			memset(value, 0, sizeof(char) * 128);
+			memset(value, 0, sizeof(char) * 256);
 			
 			sscanf(line, "%s = %s", id, value);
 			if(!strcmp(id, "CLIENT_LISTEN_PORT"))
@@ -85,10 +47,18 @@ void load_config_file(char *file)
 				MAX_TRANS_PORT = atoi(value);
 			else if(!strcmp(id, "INTERFACE_ID"))
 				INTERFACE_ID = atoi(value);
-			else if(!strcmp(id, "SERVER_IP"))
+			else if(!strcmp(id, "SERVER_IP")) {
+				memset(SERVER_IP, 0, IPV4_ADDR_LEN * sizeof(char));
 				strcpy(SERVER_IP, value);
-			else if(!strcmp(id, "CLIENT_IP"))
+			}
+			else if(!strcmp(id, "CLIENT_IP")) {
+				memset(CLIENT_IP, 0, IPV4_ADDR_LEN * sizeof(char));
 				strcpy(CLIENT_IP, value);
+			}
+			else if(!strcmp(id, "SHARE_DIR")) {
+				memset(SHARE_DIR, 0, 256 * sizeof(char));
+				strcpy(SHARE_DIR, value);
+			}
 			else
 				printf("unknown parameter: %s\n", id);
 		}
@@ -107,8 +77,73 @@ void load_config_file(char *file)
 			exit(-1);
 		}
 	}
+	
+	if(strcmp(SHARE_DIR, "empty") == 0) {
+		memset(SHARE_DIR, 0, 256 * sizeof(char));
+		sprintf(SHARE_DIR, "%s/Download/", cmd_system("echo $HOME"));
+	}
 
-	printf("%d %d %d %d %s %s\n", CLIENT_LISTEN_PORT, MIN_TRANS_PORT, MAX_TRANS_PORT, INTERFACE_ID, SERVER_IP, CLIENT_IP);
+	printf("%d %d %d %d %s %s %s\n", CLIENT_LISTEN_PORT, MIN_TRANS_PORT, MAX_TRANS_PORT, INTERFACE_ID, SERVER_IP, CLIENT_IP, SHARE_DIR);
+}
+
+void exit_save(void)
+{
+	//TODO: save all necessary info before exit
+}
+
+void client_exit(int para)
+{ 
+	//TODO:
+	
+	exit(1);
+}
+
+void init_var(void)
+{
+	//TODO: init all needed variables. eg: the table maintain the status of each sharing file
+}
+
+bool construct_cli_msg(char **msg, int type)
+{
+//TODO: construct the CLI msg...
+}
+
+void download_file(char *file_id)
+{
+	if(check_pidfile("PP2P_client") == false) {
+	//tell client daemon what job needs to do by UNIX socket. Once the client daemon receives the request it will fork a new process to handle the job
+		int cli_fd = open_unix_socket_out(UNIX_SOCK_PATH);
+		char *cli_msg;
+		
+		if(construct_cli_msg(&cli_msg, 0/*new download*/) == false)
+			abort();
+		
+		if(socket_write(cli_fd, cli_msg, strlen(cli_msg)) <= 0)
+			perror("failed to start a new job");
+		
+		close(cli_fd);
+		free(cli_msg);
+		exit(0);
+	}
+	else {
+	//setup the client daemon with cli module
+	
+	}
+	
+	//set process env first
+	loop = EV_DEFAULT;
+	
+	CatchSignal(SIGTERM, client_exit);
+	BlockSignals(false, SIGTERM);
+	BlockSignals(true,SIGPIPE);
+	
+	int client2srv_fd;
+	client2srv_fd = open_socket_out(SERVER_PORT, SERVER_IP);
+	
+	int p2p_listen_fd;
+	p2p_listen_fd = open_socket_in(CLIENT_LISTEN_PORT, CLIENT_IP);
+	
+	init_var();
 }
 
 void show_usage(void)
@@ -128,11 +163,6 @@ void show_shared_files(void)
 //
 /*test:*/	
 //	load_config_file(CONFIG_FILE);
-}
-
-void download_file(char *file_id)
-{
-//TODO:
 }
 
 void restore_download(char *file_path)

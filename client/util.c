@@ -1,25 +1,10 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/stat.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <string.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <net/if.h>
+#include "includes.h"
 
-#define IPV4_ADDR_LEN	16
+#include "util.h"
 
 char *cmd_system(const char *cmd)
 {
-#define BUFLEN	512
+
 	static char buf[BUFLEN];
 	char *res = "";
 	char tmp[BUFLEN] = {0};
@@ -38,7 +23,6 @@ char *cmd_system(const char *cmd)
 	res = buf;
 
 	return res;
-#undef BUFLEN
 }
 
 bool fcntl_lock(int fd, int op, off_t offset, off_t count, int type)
