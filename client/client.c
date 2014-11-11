@@ -1,8 +1,12 @@
 #include "includes.h"
+#include "socket.h"
+#include "common.h"
+#include "util.h"
 
 #include <ev.h>
 
 #define IPV4_ADDR_LEN	16
+#define CLI_MSG_LEN		512
 #define G_SRV_IP_ADDR	"10.0.0.1"
 #define G_CONFIG_FILE	"/etc/PP2P/client.config"
 #define UNIX_SOCK_PATH	"/tmp/PP2P.sock"
@@ -18,6 +22,9 @@ char SERVER_IP[IPV4_ADDR_LEN] = G_SRV_IP_ADDR;
 char CLIENT_IP[IPV4_ADDR_LEN] = "0.0.0.0";
 char CONFIG_FILE[256] = G_CONFIG_FILE;
 char SHARE_DIR[256] = "empty";
+unsigned int ID;
+
+extern int errno;
 
 struct ev_loop *loop;
 
@@ -100,12 +107,97 @@ void client_exit(int para)
 
 void init_var(void)
 {
-	//TODO: init all needed variables. eg: the table maintain the status of each sharing file
+	//TODO: init all needed GLOBAL variables. eg: the table maintain the status of each sharing file
 }
 
 bool construct_cli_msg(char **msg, int type)
 {
 //TODO: construct the CLI msg...
+
+}
+
+void parse_cli_cmd(char *cmd)
+{
+//TODO:
+//parse the cmd and excute it...
+
+}
+
+void cli_cmd_cb(EV_P_ ev_io *w, int events)
+{
+	ssize_t read;
+	char buf[CLI_MSG_LEN] = {0};
+	read = socket_read(w->fd, buf, sizeof(buf));
+
+	if(read == 0 || read == -1) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+		
+		close(w->fd);
+		ev_io_stop(loop, w);
+		free(w);
+		w = NULL;
+		return;
+	}
+
+	parse_cli_cmd(buf);
+}
+
+void accept_cli_cb(EV_P_ ev_io *w, int events)
+{
+	int fd;
+	fd = accept(w->fd, NULL, NULL);
+	if(fd == -1) {
+		if(errno != EAGAIN && errno != EWOULDBLOCK) {
+			perror("accept");
+			exit(-1);
+		}
+		return;
+	}
+
+	set_socketopt(fd);
+	set_blocking(fd, false);
+
+	ev_io *cli_client_io = (ev_io *)malloc(sizeof(ev_io));
+	ev_io_init(cli_client_io, cli_cmd_cb, fd, EV_READ);
+	ev_io_start(loop, cli_client_io);
+}
+
+void reply_server_cb(EV_P_ ev_io *w, int events)
+{
+//TODO: 1. handle if it is server reply about file ID check - start the download job
+//		2. handle if it is server keepalive msg - reply client's status
+	
+}
+
+void peer_req_cb(EV_P_ ev_io *w, int events)
+{
+//TODO: parse peer req: 1. conn req - setup data trans listening port for the peer
+//					 2. keepalive msg - exchange file bitmap info
+}
+
+void accept_peer_cb(EV_P_ ev_io *w, int events)
+{
+	int fd;
+	fd = accept(w->fd, NULL, NULL);
+	if(fd == -1 &&
+		errno != EAGAIN &&
+		errno != EWOULDBLOCK) {
+		printf("peer accept error: %s\n", strerror(errno));
+		return;
+	}
+
+	set_socketopt(fd);
+	set_blocking(fd, false);
+
+	ev_io *peer_listen_io = (ev_io *)malloc(sizeof(ev_io));
+	ev_io_init(peer_listen_io, peer_req_cb, fd, EV_READ);
+	ev_io_start(loop, peer_listen_io);
+}
+
+void check_fileID(int fd, char *id)
+{
+	//TODO: just send chekc_fileID req to server
 }
 
 void download_file(char *file_id)
@@ -127,23 +219,38 @@ void download_file(char *file_id)
 	}
 	else {
 	//setup the client daemon with cli module
+		loop = EV_DEFAULT;
+
+		CatchSignal(SIGTERM, client_exit);
+		BlockSignals(false, SIGTERM);
+		BlockSignals(true,SIGPIPE);
+
+		init_var();
+
+		daemon(1, 1);
+
+		int clientCLI_fd;
+		ev_io cli_io;
+		clientCLI_fd = open_unix_socket_in(UNIX_SOCK_PATH);
+		ev_io_init(&cli_io, accept_cli_cb, clientCLI_fd, EV_READ);
+		ev_io_start(loop, &cli_io);
+
+		int client2srv_fd;
+		ev_io csrv_io;
+		client2srv_fd = open_socket_out(SERVER_PORT, SERVER_IP);
+		ev_io_init(&csrv_io, reply_server_cb, client2srv_fd, EV_READ);
+		ev_io_start(loop, &csrv_io);
 	
+		int p2p_listen_fd;
+		ev_io plisten_io;
+		p2p_listen_fd = open_socket_in(CLIENT_LISTEN_PORT, CLIENT_IP); 
+		ev_io_init(&plisten_io, accept_peer_cb, p2p_listen_fd, EV_READ);
+		ev_io_start(loop, &plisten_io);
+
+		check_fileID(client2srv_fd, file_id);
+
+		ev_run(loop, 0);
 	}
-	
-	//set process env first
-	loop = EV_DEFAULT;
-	
-	CatchSignal(SIGTERM, client_exit);
-	BlockSignals(false, SIGTERM);
-	BlockSignals(true,SIGPIPE);
-	
-	int client2srv_fd;
-	client2srv_fd = open_socket_out(SERVER_PORT, SERVER_IP);
-	
-	int p2p_listen_fd;
-	p2p_listen_fd = open_socket_in(CLIENT_LISTEN_PORT, CLIENT_IP);
-	
-	init_var();
 }
 
 void show_usage(void)
