@@ -180,18 +180,19 @@ ssize_t socket_read(int fd, char *buff, size_t len)
 	size_t total = 0;  
   	ssize_t  ret;
 
-  	while (total < len)
-    {
-      	ret = real_recv(fd, buff + total, len - total);
+  	while (total < len) {
+      		ret = real_recv(fd, buff + total, len - total);
 
 		/* ret == 0 means the other end is closed. 
 		 * ret == -1 means recv error.
 		*/
-      	if(ret == 0 || ret == -1)
-			return ret;
-			
-      	total += ret;
-    }
+		if(ret == -1)
+			return -1;
+		if(ret == 0)
+			break;
+
+      		total += ret;
+    	}
 	
   	return total;
 }
@@ -214,14 +215,15 @@ ssize_t socket_write(int fd, char *buffer, size_t len)
 	size_t total = 0;
 	ssize_t ret;
 
-	while (total < len)
-	{
+	while (total < len) {
 		ret = real_send(fd, buffer + total, len - total);
 
-		if(ret == 0 || ret == -1)
-			return ret;
+		if(ret == -1)
+			return -1;
+		if(ret == 0)
+			break;
 
 		total += ret;
-    }
+    	}
 	return total;
 }
