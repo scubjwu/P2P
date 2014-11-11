@@ -1,17 +1,14 @@
 #include "includes.h"
+
 #include "socket.h"
 #include "common.h"
 #include "util.h"
+#include "client.h"
 
 #include <ev.h>
-
-#define IPV4_ADDR_LEN	16
-#define CLI_MSG_LEN		512
-#define G_SRV_IP_ADDR	"10.0.0.1"
-#define G_CONFIG_FILE	"/etc/PP2P/client.config"
-#define UNIX_SOCK_PATH	"/tmp/PP2P.sock"
 	
 int SERVER_PORT = 49999;
+double VERSION = 0.01;
 
 //read from config file
 int CLIENT_LISTEN_PORT = 60010;
@@ -22,11 +19,37 @@ char SERVER_IP[IPV4_ADDR_LEN] = G_SRV_IP_ADDR;
 char CLIENT_IP[IPV4_ADDR_LEN] = "0.0.0.0";
 char CONFIG_FILE[256] = G_CONFIG_FILE;
 char SHARE_DIR[256] = "empty";
+
 unsigned int ID;
+struct pmsg_t CSRV_MSG_OUT;
+struct pmsg_t CSRV_MSG_IN;
 
 extern int errno;
 
 struct ev_loop *loop;
+
+#define cli_fd_close(watcher)	\
+{							\
+	close((watcher)->fd);		\
+	ev_io_stop(loop, watcher);	\
+	free(watcher);			\
+	watcher = NULL;			\
+}
+
+int file_check_fn(EV_P_ ev_io *w);
+int server_keepalive_fn(EV_P_ ev_io *w);
+
+struct msg_handle_fn {
+	char *name;
+	int (* func) ();
+}
+msg_fns[3] = {
+
+/*0x00*/		{NULL, NULL},
+/*0x01*/		{"filecheck", file_check_fn},
+/*0x02*/		{"srvkeepalive", server_keepalive_fn}
+//TODO:
+};
 
 void load_config_file(char *file)
 {
@@ -108,39 +131,66 @@ void client_exit(int para)
 void init_var(void)
 {
 	//TODO: init all needed GLOBAL variables. eg: the table maintain the status of each sharing file
+	ID = getclientID();
+
+	CSRV_MSG_OUT.magic = MAGIC_NUM;
+	CSRV_MSG_OUT.version = VERSION;
+	CSRV_MSG_OUT.cid = ID;
+
 }
 
-bool construct_cli_msg(char **msg, int type)
+void check_fileID(int fd, char *fid)
 {
-//TODO: construct the CLI msg...
+	CSRV_MSG_OUT.type = 0x01;
+	CSRV_MSG_OUT.len = strlen(fid);
+	strcpy(CSRV_MSG_OUT.content, fid);
 
+	if(socket_write(fd, (char *)&CSRV_MSG_OUT, msg_header_len + CSRV_MSG_OUT.len) <= 0)
+		perror("failed to connect to server.\n");
 }
 
-void parse_cli_cmd(char *cmd)
+void start_new_download(int fd, char *cmd)
 {
-//TODO:
+	check_fileID(fd, cmd);
+}
+
+void parse_cli_cmd(int fd, unsigned type, char *cmd)
+{
 //parse the cmd and excute it...
-
+	switch (type) {
+	case 0:
+		start_new_download(fd, cmd);
+		break;
+	//TODO: add new cli msg to be parsed here
+	
+	default:
+		printf("error cli msg\n");
+		break;
+	}
 }
 
 void cli_cmd_cb(EV_P_ ev_io *w, int events)
 {
 	ssize_t read;
-	char buf[CLI_MSG_LEN] = {0};
-	read = socket_read(w->fd, buf, sizeof(buf));
+	struct cli_cmd_t data;
+	size_t cli_head_len = cli_cmd_header_len;
+	
+	read = socket_read(w->fd, (char *)&data, cli_head_len);
+	if(read != cli_head_len) {
+		cli_fd_close(w);
+		return;
+	}
 
+	read = socket_read(w->fd, data.cmd, data.len);
 	if(read == 0 || read == -1) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 		
-		close(w->fd);
-		ev_io_stop(loop, w);
-		free(w);
-		w = NULL;
+		cli_fd_close(w);
 		return;
 	}
 
-	parse_cli_cmd(buf);
+	parse_cli_cmd(w->fd, data.type, data.cmd);
 }
 
 void accept_cli_cb(EV_P_ ev_io *w, int events)
@@ -163,11 +213,92 @@ void accept_cli_cb(EV_P_ ev_io *w, int events)
 	ev_io_start(loop, cli_client_io);
 }
 
+void init_peer_conn(struct peer_list_t peer)
+{
+//TODO: init peer connection
+
+}
+
+void build_csrv_keepalive(char *fid)
+{
+	CSRV_MSG_OUT.type = 0x02;
+
+	//TODO: get the file bitmap
+}
+
+int server_keepalive_fn(EV_P_ ev_io *w)
+{
+	if(CSRV_MSG_IN.len != MD5_LEN) {
+		printf("invalid file id from srv keepalive msg\n");
+		return -1;
+	}
+	
+	ssize_t read;
+	char fid[MD5_LEN];
+	read = socket_read(w->fd, fid, MD5_LEN);
+	if(read == 0 || read == -1 || read != MD5_LEN) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+		
+		cli_fd_close(w);
+		return -1;
+	}
+	
+	build_csrv_keepalive(fid);
+
+	if(socket_write(w->fd, (char *)&CSRV_MSG_OUT, msg_header_len + CSRV_MSG_OUT.len) <= 0)
+		perror("failed to connect to server.\n");
+}
+
+int file_check_fn(EV_P_ ev_io *w)
+{
+	ssize_t read;
+	int i;
+	int peer_num = CSRV_MSG_IN.len / sizeof(struct peer_list_t);
+	if(peer_num == 0) {
+		printf("file id error\n");
+		return -1;
+	}
+
+	struct peer_list_t peers[peer_num];
+	read = socket_read(w->fd, (char *)peers, CSRV_MSG_IN.len);
+	if(read == 0 || read == -1 || read != CSRV_MSG_IN.len) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+		
+		cli_fd_close(w);
+		return -1;
+	}
+
+	for(i=0; i<peer_num; i++) {
+		init_peer_conn(peers[i]);
+	}
+}
+
 void reply_server_cb(EV_P_ ev_io *w, int events)
 {
-//TODO: 1. handle if it is server reply about file ID check - start the download job
-//		2. handle if it is server keepalive msg - reply client's status
+// 1. handle if it is server reply about file ID check - start the download job
+// 2. handle if it is server keepalive msg - reply client's status
+
+	ssize_t read;
+	size_t len = msg_header_len;
 	
+	read = socket_read(w->fd, (char *)&CSRV_MSG_IN, len);
+	if(read != len || 
+		//sanity check the msg header...
+		CSRV_MSG_IN.magic != MAGIC_NUM || 
+		CSRV_MSG_IN.cid != ID || 
+		CSRV_MSG_IN.version == 0.) {
+		cli_fd_close(w);
+		return;
+	}
+
+	if(msg_fns[CSRV_MSG_IN.type].func == NULL) {
+		printf("unknown msg type\n");
+		return;
+	}
+
+	msg_fns[CSRV_MSG_IN.type].func(w);
 }
 
 void peer_req_cb(EV_P_ ev_io *w, int events)
@@ -195,26 +326,19 @@ void accept_peer_cb(EV_P_ ev_io *w, int events)
 	ev_io_start(loop, peer_listen_io);
 }
 
-void check_fileID(int fd, char *id)
-{
-	//TODO: just send chekc_fileID req to server
-}
-
 void download_file(char *file_id)
 {
 	if(check_pidfile("PP2P_client") == false) {
 	//tell client daemon what job needs to do by UNIX socket. Once the client daemon receives the request it will fork a new process to handle the job
 		int cli_fd = open_unix_socket_out(UNIX_SOCK_PATH);
-		char *cli_msg;
+
+		struct cli_cmd_t data = {.type = 0, .len = strlen(file_id)};
+		strcpy(data.cmd, file_id);
 		
-		if(construct_cli_msg(&cli_msg, 0/*new download*/) == false)
-			abort();
-		
-		if(socket_write(cli_fd, cli_msg, strlen(cli_msg)) <= 0)
+		if(socket_write(cli_fd, (char *)&data, cli_cmd_header_len + data.len) <= 0)
 			perror("failed to start a new job");
 		
 		close(cli_fd);
-		free(cli_msg);
 		exit(0);
 	}
 	else {
@@ -307,7 +431,10 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'D':
-			download_file(optarg);
+			if(strlen(optarg) < MD5_LEN * sizeof(char))
+				printf("invalid file ID.\n");
+			else
+				download_file(optarg);
 			break;
 
         	case 'R':

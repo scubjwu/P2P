@@ -1,7 +1,6 @@
 #ifndef _UTIL_H
 #define _UTIL_H
 
-#define IPV4_ADDR_LEN	16
 #define BUFLEN	512
 
 char *cmd_system(const char *cmd);
