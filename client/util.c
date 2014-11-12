@@ -2,6 +2,8 @@
 
 #include "util.h"
 
+#define BUFLEN	512
+
 char *cmd_system(const char *cmd)
 {
 

@@ -1,8 +1,4 @@
-#define _GNU_SOURCE
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <strings.h>
+#include "includes.h"
 
 #include "fifo.h"
 

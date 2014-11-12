@@ -56,7 +56,7 @@ int open_unix_socket_in(char *path)
 	sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (-1 == sfd) {
 		perror("socket error");
-		exit(1);
+		return -1;
 	}
 	unlink(path);
 
@@ -65,7 +65,7 @@ int open_unix_socket_in(char *path)
 	
 	if(bind(sfd, (const struct sockaddr *)&unix_sock, (socklen_t)sizeof(unix_sock)) == -1 ) {
 		perror("bind error");
-		exit(1); 
+		return -1;
 	}
 	
 	set_socketopt(sfd);
@@ -73,7 +73,7 @@ int open_unix_socket_in(char *path)
 	
 	if (listen(sfd, 50) == -1) {
 		perror("listen error");
-		exit(1);
+		return -1;
 	}
 	
 	return sfd;
@@ -86,7 +86,7 @@ int open_socket_in(int port, char *ip_addr)
 	
 	if ((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
 		perror("socket error");
-		exit(1);
+		return -1;
 	}
 	
 	bzero(&addr, sizeof(addr));
@@ -96,7 +96,7 @@ int open_socket_in(int port, char *ip_addr)
 	
 	if(bind(sfd, (const struct sockaddr *)&addr, (socklen_t)sizeof(addr)) == -1 ) {
 		perror("bind error");
-		exit(1); 
+		return -1;
 	}
 	
 	set_socketopt(sfd);
@@ -104,7 +104,7 @@ int open_socket_in(int port, char *ip_addr)
 	
 	if (listen(sfd, 50) == -1) {
 		perror("listen error");
-		exit(1);
+		return -1;
 	}
 	
 	return sfd;
@@ -118,7 +118,7 @@ int open_unix_socket_out(const char *path)
 	sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (-1 == sfd) {
 		perror("socket error");
-		exit(1);
+		return -1;
 	}
 
 	bzero(&unix_sock, sizeof(unix_sock));
@@ -127,7 +127,7 @@ int open_unix_socket_out(const char *path)
 
 	if(connect(sfd, (struct sockaddr *)&unix_sock, (socklen_t)sizeof(unix_sock)) < 0) {
 		perror("connect error");
-		exit(1);
+		return -1;
 	}
 	
 	set_socketopt(sfd);
@@ -143,7 +143,7 @@ int open_socket_out(int port, char *ip_addr)
 	
 	if((sfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
 		perror("socket error");
-		exit(1);
+		return -1;
 	}
 	
 	bzero(&addr, sizeof(addr));
@@ -153,7 +153,7 @@ int open_socket_out(int port, char *ip_addr)
 	
 	if(connect(sfd, (const struct sockaddr *)&addr, (socklen_t)sizeof(addr)) < 0) {
 		perror("connect error");
-		exit(1);
+		return -1;
 	}
 	
 	set_socketopt(sfd);
