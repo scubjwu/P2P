@@ -1,11 +1,13 @@
 #include "includes.h"
+#include <ev.h>
 
 #include "socket.h"
 #include "common.h"
 #include "util.h"
-#include "client.h"
+#include "list.h"
+#include "fifo.h"
 
-#include <ev.h>
+#include "client.h"
 	
 int SERVER_PORT = 49999;
 double VERSION = 0.01;
@@ -21,19 +23,23 @@ char CONFIG_FILE[256] = G_CONFIG_FILE;
 char SHARE_DIR[256] = "empty";
 
 unsigned int ID;
-struct pmsg_t CSRV_MSG_OUT;
-struct pmsg_t CSRV_MSG_IN;
+struct pmsg_t P2P_MSG_OUT;
+struct pmsg_t P2P_MSG_IN;
+struct list_head JOBS;
 
 extern int errno;
 
 struct ev_loop *loop;
 
-#define cli_fd_close(watcher)	\
+#define ev_fd_close(watcher)	\
 {							\
 	close((watcher)->fd);		\
 	ev_io_stop(loop, watcher);	\
-	free(watcher);			\
-	watcher = NULL;			\
+}
+
+#define _free(x)	\
+{				\
+	if(x)	free(x);	\
 }
 
 int file_check_fn(EV_P_ ev_io *w);
@@ -133,19 +139,20 @@ void init_var(void)
 	//TODO: init all needed GLOBAL variables. eg: the table maintain the status of each sharing file
 	ID = getclientID();
 
-	CSRV_MSG_OUT.magic = MAGIC_NUM;
-	CSRV_MSG_OUT.version = VERSION;
-	CSRV_MSG_OUT.cid = ID;
+	P2P_MSG_OUT.magic = MAGIC_NUM;
+	P2P_MSG_OUT.version = VERSION;
+	P2P_MSG_OUT.cid = ID;
 
+	INIT_LIST_HEAD(&JOBS);
 }
 
 void check_fileID(int fd, char *fid)
 {
-	CSRV_MSG_OUT.type = 0x01;
-	CSRV_MSG_OUT.len = strlen(fid);
-	strcpy(CSRV_MSG_OUT.content, fid);
+	P2P_MSG_OUT.type = 0x01;
+	P2P_MSG_OUT.len = strlen(fid);
+	strcpy(P2P_MSG_OUT.content, fid);
 
-	if(socket_write(fd, (char *)&CSRV_MSG_OUT, msg_header_len + CSRV_MSG_OUT.len) <= 0)
+	if(socket_write(fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0)
 		perror("failed to connect to server.\n");
 }
 
@@ -177,7 +184,8 @@ void cli_cmd_cb(EV_P_ ev_io *w, int events)
 	
 	read = socket_read(w->fd, (char *)&data, cli_head_len);
 	if(read != cli_head_len) {
-		cli_fd_close(w);
+		ev_fd_close(w);
+		_free(w);
 		return;
 	}
 
@@ -186,7 +194,8 @@ void cli_cmd_cb(EV_P_ ev_io *w, int events)
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 		
-		cli_fd_close(w);
+		ev_fd_close(w);
+		_free(w);
 		return;
 	}
 
@@ -213,66 +222,247 @@ void accept_cli_cb(EV_P_ ev_io *w, int events)
 	ev_io_start(loop, cli_client_io);
 }
 
-void init_peer_conn(struct peer_list_t peer)
+void peerinfo_cb(EV_P_ ev_io *w, int events)
 {
-//TODO: init peer connection
+//handle incoming msg on client listening port
+	ssize_t read;
+	size_t len = msg_header_len;
+	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
+	if(read != len ||
+		P2P_MSG_IN.magic != MAGIC_NUM ||
+		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.len == 0) {
+		ev_fd_close(w);
+		return;
+	}
 
+	int dlen = P2P_MSG_IN.len;	
+	char data[dlen];
+	read = socket_read(w->fd, data, dlen);
+	if(read == 0 || read == -1 || read != dlen) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+		
+		ev_fd_close(w);
+		return;
+	}
+	
+	char file_id[MD5_LEN] = {0};
+	memcpy(file_id, data, MD5_LEN);
+
+	unsigned int msg_type;
+	memcpy(&msg_type, data + MD5_LEN, sizeof(unsigned int));
+
+	if(msg_type == 1 /*conn rep msg*/) {
+//TODO:
+	}
+	else if(msg_type == 2 /*peer keepalive msg*/) {
+//TODO:
+	}
+}
+
+void peer_keepalive(EV_P_ ev_timer *w, int events)
+{
+//send keepalive msg to peer
+	struct peer_info_t *ptr;
+	ptr = container_of(w, struct peer_info_t, peerinfo_timer);
+	struct download_job_t *job = ptr->job;
+
+	if(ptr->alive > KEEPALIVE_TIMEOUT) {
+//TODO: if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we need to remove this peer	
+	}
+	
+	P2P_MSG_OUT.type = 0x04;
+	P2P_MSG_OUT.len = MD5_LEN + job->map_len;
+	
+	char *p = P2P_MSG_OUT.content;
+	memcpy(p, job->file_id, MD5_LEN);
+	memcpy(p + MD5_LEN, job->file_map, job->map_len);
+
+	ptr->alive++;
+	if(socket_write(ptr->peerinfo_io.fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
+		ev_fd_close(&(ptr->peerinfo_io));
+		return;
+	}
+}
+
+void build_peer_connreq(char *fid, char *file_map)
+{
+	int map_len = strlen(file_map);
+	P2P_MSG_OUT.type = 0x03;
+	P2P_MSG_OUT.len = MD5_LEN + map_len;
+
+	char *p = P2P_MSG_OUT.content;
+	memcpy(p, fid, MD5_LEN);
+	memcpy(p + MD5_LEN, file_map, map_len);
+}
+
+void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_job_t *job)
+{
+	int peerinfo_fd;
+	
+	//TODO: need to use ICE to setup peer socket fd!!!
+	peerinfo_fd = open_socket_out(peer.port, peer.ip);
+	if(peerinfo_fd == -1)
+		return;
+
+	struct peer_info_t *ptr = (struct peer_info_t *)malloc(sizeof(struct peer_info_t));
+
+	ptr->job = job;
+	ptr->peer_id = peer.cid;
+	ptr->peer_filemap = NULL;
+	ptr->alive = 0;
+	
+	ev_io_init(&(ptr->peerinfo_io), peerinfo_cb, peerinfo_fd, EV_READ);
+	ev_io_start(loop, &(ptr->peerinfo_io));
+
+	build_peer_connreq(fid, job->file_map);
+	if(socket_write(peerinfo_fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
+		perror("failed to make connection with peer.\n");
+		ev_fd_close(&(ptr->peerinfo_io));
+		_free(ptr);
+		return;
+	}
+
+	ev_timer_init(&(ptr->peerinfo_timer), peer_keepalive, PEER_KEEPALIVE_TINTER, PEER_KEEPALIVE_TINTER);
+	ev_timer_start(loop, &(ptr->peerinfo_timer));
+
+	list_add(&(ptr->list), &(job->peer_list));
 }
 
 void build_csrv_keepalive(char *fid)
 {
-	CSRV_MSG_OUT.type = 0x02;
+	P2P_MSG_OUT.type = 0x02;
+	P2P_MSG_OUT.len = 0;
 
-	//TODO: get the file bitmap
+	//get the file bitmap
+	struct download_job_t *ptr;
+	list_for_each_entry(ptr, &JOBS, list) {
+		if(strcmp(ptr->file_id, fid) == 0) {
+			P2P_MSG_OUT.len = ptr->map_len;
+			strcpy(P2P_MSG_OUT.content, ptr->file_map);
+			break;
+		}
+	}
+}
+
+struct download_job_t *find_job(char *fid)
+{
+	struct download_job_t *res;
+
+	list_for_each_entry(res, &JOBS, list) {
+		if(strcmp(res->file_id, fid) == 0)
+			return res;
+	}
+
+	return NULL;
+}
+
+bool find_peer(struct list_head *plist, unsigned int id)
+{
+	struct peer_info_t *res;
+
+	list_for_each_entry(res, plist, list) {
+		if(res->peer_id == id)
+			return true;
+	}
+
+	return false;
 }
 
 int server_keepalive_fn(EV_P_ ev_io *w)
 {
-	if(CSRV_MSG_IN.len != MD5_LEN) {
-		printf("invalid file id from srv keepalive msg\n");
-		return -1;
-	}
-	
 	ssize_t read;
-	char fid[MD5_LEN];
-	read = socket_read(w->fd, fid, MD5_LEN);
-	if(read == 0 || read == -1 || read != MD5_LEN) {
+	int dlen = P2P_MSG_IN.len;
+	int peer_num = (dlen - MD5_LEN) / sizeof(struct peer_list_t);
+
+	char data[dlen];
+	read = socket_read(w->fd, data, dlen);
+	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 		
-		cli_fd_close(w);
+		ev_fd_close(w);
 		return -1;
 	}
 	
+	char fid[MD5_LEN];
+	memcpy(fid, data, MD5_LEN);
+	
 	build_csrv_keepalive(fid);
-
-	if(socket_write(w->fd, (char *)&CSRV_MSG_OUT, msg_header_len + CSRV_MSG_OUT.len) <= 0)
+	if(socket_write(w->fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0)
 		perror("failed to connect to server.\n");
+
+	if(peer_num == 0)
+		return 0;
+
+	struct peer_list_t peers[peer_num];
+	memcpy(peers, data + MD5_LEN, peer_num * sizeof(struct peer_list_t));
+
+	struct download_job_t *job = find_job(fid);
+	int i;
+	for(i=0; i<peer_num; i++) {
+		if(find_peer(&(job->peer_list), peers[i].cid) == false)
+			init_peer_conn(EV_A_ peers[i], fid, job);
+	}
+}
+
+struct download_job_t *add_download_job(char *fid, unsigned int map_len, unsigned int peer_num)
+{
+	struct download_job_t *new = (struct download_job_t *)malloc(sizeof(struct download_job_t));
+
+	strcpy(new->file_id, fid);
+	new->map_len = map_len;
+	new->file_map = (char *)calloc(map_len, sizeof(char));
+	new->peer_num = peer_num;
+	INIT_LIST_HEAD(&(new->peer_list));
+	
+	list_add(&new->list, &JOBS);
+
+	return new;
 }
 
 int file_check_fn(EV_P_ ev_io *w)
 {
 	ssize_t read;
 	int i;
-	int peer_num = CSRV_MSG_IN.len / sizeof(struct peer_list_t);
-	if(peer_num == 0) {
+	int dlen = P2P_MSG_IN.len;
+	int peer_num = (dlen - MD5_LEN - sizeof(unsigned int)) / sizeof(struct peer_list_t);
+	if(peer_num < 0) {
 		printf("file id error\n");
 		return -1;
 	}
+	
+	if(peer_num == 0) {
+		printf("no peers to share the file\n");
+		return 0;
+	}
 
-	struct peer_list_t peers[peer_num];
-	read = socket_read(w->fd, (char *)peers, CSRV_MSG_IN.len);
-	if(read == 0 || read == -1 || read != CSRV_MSG_IN.len) {
+	char data[dlen];
+	read = socket_read(w->fd, data, dlen);
+	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 		
-		cli_fd_close(w);
+		ev_fd_close(w);
 		return -1;
 	}
 
-	for(i=0; i<peer_num; i++) {
-		init_peer_conn(peers[i]);
-	}
+	char file_id[MD5_LEN] = {0};
+	memcpy(file_id, data, MD5_LEN);
+
+	unsigned int bitmap_len;
+	memcpy(&bitmap_len, data + MD5_LEN, sizeof(unsigned int));
+
+	struct peer_list_t peers[peer_num];
+	memcpy(peers, data + MD5_LEN + sizeof(unsigned int), peer_num * sizeof(struct peer_list_t));
+
+	struct download_job_t *job = add_download_job(file_id, bitmap_len, peer_num);
+
+	for(i=0; i<peer_num; i++)
+		init_peer_conn(EV_A_ peers[i], file_id, job);
+
+	return 0;
 }
 
 void reply_server_cb(EV_P_ ev_io *w, int events)
@@ -283,22 +473,22 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 	ssize_t read;
 	size_t len = msg_header_len;
 	
-	read = socket_read(w->fd, (char *)&CSRV_MSG_IN, len);
+	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
 	if(read != len || 
 		//sanity check the msg header...
-		CSRV_MSG_IN.magic != MAGIC_NUM || 
-		CSRV_MSG_IN.cid != ID || 
-		CSRV_MSG_IN.version == 0.) {
-		cli_fd_close(w);
+		P2P_MSG_IN.magic != MAGIC_NUM || 
+		P2P_MSG_IN.cid != ID || 
+		P2P_MSG_IN.version == 0.) {
+		ev_fd_close(w);
 		return;
 	}
 
-	if(msg_fns[CSRV_MSG_IN.type].func == NULL) {
+	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
 		printf("unknown msg type\n");
 		return;
 	}
 
-	msg_fns[CSRV_MSG_IN.type].func(w);
+	msg_fns[P2P_MSG_IN.type].func(w);
 }
 
 void peer_req_cb(EV_P_ ev_io *w, int events)
@@ -329,8 +519,10 @@ void accept_peer_cb(EV_P_ ev_io *w, int events)
 void download_file(char *file_id)
 {
 	if(check_pidfile("PP2P_client") == false) {
-	//tell client daemon what job needs to do by UNIX socket. Once the client daemon receives the request it will fork a new process to handle the job
+	//tell client daemon what job needs to do by UNIX socket. Once the client daemon receives the request it will handle the job
 		int cli_fd = open_unix_socket_out(UNIX_SOCK_PATH);
+		if(cli_fd == -1)
+			exit(-1);
 
 		struct cli_cmd_t data = {.type = 0, .len = strlen(file_id)};
 		strcpy(data.cmd, file_id);
@@ -356,18 +548,27 @@ void download_file(char *file_id)
 		int clientCLI_fd;
 		ev_io cli_io;
 		clientCLI_fd = open_unix_socket_in(UNIX_SOCK_PATH);
+		if(clientCLI_fd == -1)
+			exit(-1);
+		
 		ev_io_init(&cli_io, accept_cli_cb, clientCLI_fd, EV_READ);
 		ev_io_start(loop, &cli_io);
 
 		int client2srv_fd;
 		ev_io csrv_io;
 		client2srv_fd = open_socket_out(SERVER_PORT, SERVER_IP);
+		if(client2srv_fd == -1)
+			exit(-1);
+		
 		ev_io_init(&csrv_io, reply_server_cb, client2srv_fd, EV_READ);
 		ev_io_start(loop, &csrv_io);
 	
 		int p2p_listen_fd;
 		ev_io plisten_io;
 		p2p_listen_fd = open_socket_in(CLIENT_LISTEN_PORT, CLIENT_IP); 
+		if(p2p_listen_fd == -1)
+			exit(-1);
+		
 		ev_io_init(&plisten_io, accept_peer_cb, p2p_listen_fd, EV_READ);
 		ev_io_start(loop, &plisten_io);
 
