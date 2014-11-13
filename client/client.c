@@ -1,5 +1,6 @@
 #include "includes.h"
 #include <ev.h>
+#include <pthread.h>
 
 #include "socket.h"
 #include "common.h"
@@ -44,16 +45,24 @@ struct ev_loop *loop;
 
 int file_check_fn(EV_P_ ev_io *w);
 int server_keepalive_fn(EV_P_ ev_io *w);
+int client_conn_req_fn(EV_P_ ev_io *w);
+int peer_conn_rep_fn(EV_P_ ev_io *w);
+int client_keepalive_fn(EV_P_ ev_io *w);
+int peer_keepalive_fn(EV_P_ ev_io *w);
 
 struct msg_handle_fn {
 	char *name;
 	int (* func) ();
 }
-msg_fns[3] = {
+msg_fns[7] = {
 
 /*0x00*/		{NULL, NULL},
 /*0x01*/		{"filecheck", file_check_fn},
-/*0x02*/		{"srvkeepalive", server_keepalive_fn}
+/*0x02*/		{"srvkeepalive", server_keepalive_fn},
+/*0x03*/		{"connreq", client_conn_req_fn},
+/*0x04*/		{"connrep", peer_conn_rep_fn},
+/*0x05*/		{"clientkeepalive", client_keepalive_fn},
+/*0x06*/		{"peerkeepalive", peer_keepalive_fn}
 //TODO:
 };
 
@@ -222,9 +231,23 @@ void accept_cli_cb(EV_P_ ev_io *w, int events)
 	ev_io_start(loop, cli_client_io);
 }
 
+int peer_keepalive_fn(EV_P_ ev_io *w)
+{
+//TODO: handle peer keep-alive msg on client listening port
+// 1. file_id 2. file_bitmap 3. peer upload capacity
+}
+
+int peer_conn_rep_fn(EV_P_ ev_io *w)
+{
+//TODO: handle peer conn reply msg on client listening port
+// 1. file_id 2. peer ip 3. peer port 4. file_bitmap 
+}
+
 void peerinfo_cb(EV_P_ ev_io *w, int events)
 {
-//handle incoming msg on client listening port
+//handle incoming msg on client listening port: 
+//1. peer conn rep 0x04; 3. peer keepalive msg 0x06
+
 	ssize_t read;
 	size_t len = msg_header_len;
 	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
@@ -236,29 +259,12 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 		return;
 	}
 
-	int dlen = P2P_MSG_IN.len;	
-	char data[dlen];
-	read = socket_read(w->fd, data, dlen);
-	if(read == 0 || read == -1 || read != dlen) {
-		if(read == -1)
-			printf("socket read error: %s\n", strerror(errno));
-		
-		ev_fd_close(w);
+	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
+		printf("unknow peer msg type\n");
 		return;
 	}
-	
-	char file_id[MD5_LEN] = {0};
-	memcpy(file_id, data, MD5_LEN);
 
-	unsigned int msg_type;
-	memcpy(&msg_type, data + MD5_LEN, sizeof(unsigned int));
-
-	if(msg_type == 1 /*conn rep msg*/) {
-//TODO:
-	}
-	else if(msg_type == 2 /*peer keepalive msg*/) {
-//TODO:
-	}
+	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
 }
 
 void peer_keepalive(EV_P_ ev_timer *w, int events)
@@ -272,12 +278,16 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 //TODO: if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we need to remove this peer	
 	}
 	
-	P2P_MSG_OUT.type = 0x04;
-	P2P_MSG_OUT.len = MD5_LEN + job->map_len;
+	P2P_MSG_OUT.type = 0x05;
+	P2P_MSG_OUT.len = sizeof(struct peer_keepalive_t) + job->map_len;
+	
+	struct peer_keepalive_t msg;
+	strcpy(msg.file_id, job->file_id);
+	msg.upload = job->upload;
 	
 	char *p = P2P_MSG_OUT.content;
-	memcpy(p, job->file_id, MD5_LEN);
-	memcpy(p + MD5_LEN, job->file_map, job->map_len);
+	memcpy(p, &msg, sizeof(struct peer_keepalive_t));
+	memcpy(p + sizeof(struct peer_keepalive_t), job->file_map, job->map_len);
 
 	ptr->alive++;
 	if(socket_write(ptr->peerinfo_io.fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
@@ -312,6 +322,7 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 	ptr->peer_id = peer.cid;
 	ptr->peer_filemap = NULL;
 	ptr->alive = 0;
+	ptr->download = 0;
 	
 	ev_io_init(&(ptr->peerinfo_io), peerinfo_cb, peerinfo_fd, EV_READ);
 	ev_io_start(loop, &(ptr->peerinfo_io));
@@ -326,6 +337,14 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 
 	ev_timer_init(&(ptr->peerinfo_timer), peer_keepalive, PEER_KEEPALIVE_TINTER, PEER_KEEPALIVE_TINTER);
 	ev_timer_start(loop, &(ptr->peerinfo_timer));
+
+	ptr->chunk_queue = (unsigned int *)calloc(DEFAULT_QUEUE_LEN, sizeof(unsigned int));
+	ptr->Cqueue_len = DEFAULT_QUEUE_LEN;
+	ptr->Cq_cur = 0;
+
+	ptr->pending_queue = (unsigned int *)calloc(2 * DEFAULT_QUEUE_LEN, sizeof(unsigned int));
+	ptr->Pqueue_len = 2 * DEFAULT_QUEUE_LEN;
+	ptr->Pq_cur = 0;
 
 	list_add(&(ptr->list), &(job->peer_list));
 }
@@ -381,8 +400,9 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
-		
-		ev_fd_close(w);
+
+		printf("srv keepalive msg error\n");
+	//	ev_fd_close(w);
 		return -1;
 	}
 	
@@ -407,6 +427,27 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 	}
 }
 
+void *assign_chunk(void *arg)
+{
+	pthread_detach(pthread_self());
+	
+	struct download_job_t *job = (struct download_job_t *)arg;
+
+	for(;;) {
+		pthread_mutex_lock(&job->assign_lock);
+
+		while(job->chunk_update == 0)
+			pthread_cond_wait(&job->assign_req, &job->assign_lock);
+
+		//TODO: update the chunk array and assign chunk
+
+		job->chunk_update = 0;
+		pthread_cond_signal(&job->assign_rep);
+		
+		pthread_mutex_unlock(&job->assign_lock);
+	}
+}
+
 struct download_job_t *add_download_job(char *fid, unsigned int map_len, unsigned int peer_num)
 {
 	struct download_job_t *new = (struct download_job_t *)malloc(sizeof(struct download_job_t));
@@ -414,10 +455,21 @@ struct download_job_t *add_download_job(char *fid, unsigned int map_len, unsigne
 	strcpy(new->file_id, fid);
 	new->map_len = map_len;
 	new->file_map = (char *)calloc(map_len, sizeof(char));
+
+	new->chunk = (struct chunk_info_t *)calloc(map_len, sizeof(struct chunk_info_t));
+	new->chunk_update = 0;
+	pthread_mutex_init(&new->assign_lock, NULL);
+	pthread_cond_init(&new->assign_req, NULL);
+	pthread_cond_init(&new->assign_rep, NULL);
+
+	new->upload = 0;
 	new->peer_num = peer_num;
 	INIT_LIST_HEAD(&(new->peer_list));
 	
 	list_add(&new->list, &JOBS);
+
+	pthread_t tid;
+	pthread_create(&tid, NULL, assign_chunk, new);
 
 	return new;
 }
@@ -443,8 +495,10 @@ int file_check_fn(EV_P_ ev_io *w)
 	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
-		
-		ev_fd_close(w);
+
+		printf("%s recv msg from server error?\n", __func__);
+	//keep the srv socket open
+	//	ev_fd_close(w);
 		return -1;
 	}
 
@@ -467,8 +521,8 @@ int file_check_fn(EV_P_ ev_io *w)
 
 void reply_server_cb(EV_P_ ev_io *w, int events)
 {
-// 1. handle if it is server reply about file ID check - start the download job
-// 2. handle if it is server keepalive msg - reply client's status
+// 1. handle if it is server reply about file ID check - start the download job -0x01
+// 2. handle if it is server keepalive msg - reply client's status - 0x02
 
 	ssize_t read;
 	size_t len = msg_header_len;
@@ -479,6 +533,45 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 		P2P_MSG_IN.magic != MAGIC_NUM || 
 		P2P_MSG_IN.cid != ID || 
 		P2P_MSG_IN.version == 0.) {
+		printf("srv msg error?\n");
+	//keep the client_srv socket open...
+	//	ev_fd_close(w);
+		return;
+	}
+
+	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
+		printf("unknown msg type\n");
+		return;
+	}
+
+	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
+}
+
+int client_conn_req_fn(EV_P_ ev_io *w)
+{
+//TODO: handle client conn req msg on peer listening port
+// send reply with: 1. file_id 2. peer ip 3. peer data trans port 4. file_bitmap
+// setup data trans socket on peer to wait client data trans req
+}
+
+int client_keepalive_fn(EV_P_ ev_io *w)
+{
+//TODO: handle client keepalive detect msg on peer listening port
+//reply keepalive msg with: 1. file_id 2. peer upload capacity 3. file_bitmap
+}
+
+void peer_req_cb(EV_P_ ev_io *w, int events)
+{
+//	1. conn req - setup data trans listening port for the peer	0x03
+//	2. keepalive msg - exchange file bitmap info				0x05
+
+	ssize_t read;
+	size_t len = msg_header_len;
+	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
+	if(read != len ||
+		P2P_MSG_IN.magic != MAGIC_NUM ||
+		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.len == 0) {
 		ev_fd_close(w);
 		return;
 	}
@@ -488,13 +581,7 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 		return;
 	}
 
-	msg_fns[P2P_MSG_IN.type].func(w);
-}
-
-void peer_req_cb(EV_P_ ev_io *w, int events)
-{
-//TODO: parse peer req: 1. conn req - setup data trans listening port for the peer
-//					 2. keepalive msg - exchange file bitmap info
+	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
 }
 
 void accept_peer_cb(EV_P_ ev_io *w, int events)
