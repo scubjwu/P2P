@@ -42,5 +42,10 @@
 
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 
+#define _free(x)	\
+{				\
+	if(x)	free(x);	\
+}
+
 #endif
 

@@ -2,6 +2,8 @@
 
 #include "list.h"
 
+//the list acts like stack not fifo
+
 static inline void _list_add(struct list_head *new, struct list_head *prev, struct list_head *next)
 {	
 	new->next = next;	

@@ -4,6 +4,8 @@
 
 #include "file.h"
 
+extern char SHARE_DIR[256];
+
 void chunk_md5(unsigned char *data, unsigned long len, unsigned char *res)
 {
 	unsigned char c[MD5_DIGEST_LENGTH];
@@ -55,6 +57,43 @@ space_t available_space(const char *path)
 	return (buf.f_bfree * buf.f_bsize);
 }
 
+int file_alloc(char *name, int *fd, off_t size)
+{
+	int f;
+	char path[512] = {0};
+	sprintf(path, "%s/%s_p2p.tmp", SHARE_DIR, name);
+	f = open(path, O_CREAT | O_RDWR);
+	if(f == -1) {
+		perror("open file error");
+		return -1;
+	}
+
+	if(ftruncate(f, size) == -1) {
+		perror("ftruncate");
+		return -1;
+	}
+
+	*fd = f;
+	return 0;
+}
+
+/*
+void set_bit_true(unsigned char *bitmap, unsigned int pos)
+{
+	int index = pos / 8;
+	int loc = pos & 7;
+	
+	bitmap[index] |= (1 << loc);
+}
+
+void set_bit_false(unsigned char *bitmap, unsigned int pos)
+{
+	int index = pos / 8;
+	int loc = pos & 7;
+	
+	bitmap[index] ^= (1 << loc);
+}
+
 int main(void)
 {
 	FILE *f = fopen("./c.txt", "r");
@@ -74,4 +113,5 @@ int main(void)
 	fclose(f);
 	return 0;
 }
+*/
 

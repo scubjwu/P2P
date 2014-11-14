@@ -125,7 +125,7 @@ static unsigned long __roundup_pow_of_two(unsigned long n)
 	return 1UL << fls_long(n - 1);
 }
 
-static FIFO *fifo_init(fifo_data_t *buffer, unsigned int size)
+static FIFO *make_fifo(fifo_data_t *buffer, unsigned int size)
 {
 	FIFO *fifo;
 
@@ -167,7 +167,7 @@ FIFO *fifo_alloc(unsigned int size)
 		return NULL;
 	}
 
-	ret = fifo_init(data, size);
+	ret = make_fifo(data, size);
 
 	if(!ret)
 		free(data);
@@ -175,15 +175,37 @@ FIFO *fifo_alloc(unsigned int size)
 	return ret;
 }
 
-void fifo_free(FIFO *fifo)
+FIFO *fifo_realloc(FIFO *src, unsigned int size)
 {
-	free(fifo->data);
-	free(fifo);
+	FIFO *ret = fifo_alloc(size);
+	if(!ret)
+		return NULL;
+
+	fifo_data_t tmp;
+	while(fifo_get(src, &tmp) != -1) {
+		if(fifo_put(ret, tmp) == -1)
+			break;
+	}
+
+	fifo_free(src, 0);
+	return ret;
+}
+
+void fifo_free(FIFO *fifo, int deep)
+{
+	if(deep) {
+		fifo_data_t tmp;
+		while(fifo_get(fifo, &tmp) != -1)
+			_free(tmp);
+	}
+	
+	_free(fifo->data);
+	_free(fifo);
 }
 
 int fifo_put(FIFO *fifo, fifo_data_t put)
 {
-	if(fifo->size - fifo->in + fifo->out == 0)
+	if(FIFO_FULL(fifo))
 		return -1;
 
 	__sync_synchronize();
@@ -199,7 +221,7 @@ int fifo_put(FIFO *fifo, fifo_data_t put)
 
 int fifo_get(FIFO *fifo, fifo_data_t *get)
 {
-	if(fifo->in - fifo->out == 0)
+	if(FIFO_EMPTY(fifo))
 		return -1;
 
 	__sync_synchronize();
