@@ -138,7 +138,7 @@ static FIFO *fifo_init(fifo_data_t *buffer, unsigned int size)
 	fifo = (FIFO *)malloc(sizeof(FIFO));
 	if(!fifo) {
 		perror("malloc");
-		abort();
+		return NULL;
 	}
 
 	fifo->data = buffer;
@@ -156,7 +156,7 @@ FIFO *fifo_alloc(unsigned int size)
 	if (!is_power_of_2(size)) {
 		if(size > 0x80000000) {
 			fprintf(stderr, "size too big\n");
-			abort();
+			return NULL;
 		}
 		size = roundup_pow_of_two(size);
 	}
@@ -164,7 +164,7 @@ FIFO *fifo_alloc(unsigned int size)
 	data = (fifo_data_t)calloc(size, sizeof(fifo_data_t));
 	if (!data) {
 		perror("calloc");
-		abort();
+		return NULL;
 	}
 
 	ret = fifo_init(data, size);
@@ -177,16 +177,6 @@ FIFO *fifo_alloc(unsigned int size)
 
 void fifo_free(FIFO *fifo)
 {
-	if(fifo->in - fifo->out) {
-		printf("may have memory leak...\n");
-		int i = fifo->size;
-		while(i) {
-			if(fifo->data[i-1])
-				free(fifo->data[i-1]);
-			i--;
-		}
-	}
-
 	free(fifo->data);
 	free(fifo);
 }

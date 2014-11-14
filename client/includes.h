@@ -20,6 +20,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 
 #define IPV4_ADDR_LEN	16
 #define MD5_LEN			32

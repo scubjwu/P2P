@@ -2,7 +2,7 @@
 
 #include <openssl/md5.h>
 
-#define CHUNK_S	16384
+#include "file.h"
 
 void chunk_md5(unsigned char *data, unsigned long len, unsigned char *res)
 {
@@ -19,16 +19,40 @@ void chunk_md5(unsigned char *data, unsigned long len, unsigned char *res)
 void file_md5(FILE *f, unsigned char *res)
 {
 	unsigned char c[MD5_DIGEST_LENGTH];
-	unsigned char buf[CHUNK_S];
+	unsigned char buf[DATA_LEN];
 	MD5_CTX mdContext;
 	size_t read;
 
 	MD5_Init(&mdContext);
-	while((read = fread(buf, sizeof(unsigned char), CHUNK_S, f)) != 0)
+	while((read = fread(buf, sizeof(unsigned char), DATA_LEN, f)) != 0)
 		MD5_Update(&mdContext, buf, read);
 	MD5_Final(c, &mdContext);
 
 	memcpy(res, c, MD5_DIGEST_LENGTH * sizeof(unsigned char));
+}
+
+off_t file_size(FILE *f)
+{
+	int fd = fileno(f);
+	struct stat sbuf;
+	
+	if(fstat(fd, &sbuf) < 0) {
+		perror("fstat");
+		return -1;
+	}
+
+	return sbuf.st_size;
+}
+
+space_t available_space(const char *path)
+{
+	struct statfs buf;
+	if(statfs(path, &buf) < 0) {
+		perror("statfs");
+		return -1;
+	}
+
+	return (buf.f_bfree * buf.f_bsize);
 }
 
 int main(void)
@@ -41,6 +65,11 @@ int main(void)
 	for(i=0; i<MD5_DIGEST_LENGTH; i++)
 		printf("%02x", md5[i]);
 	printf("\n");
+
+	if(file_size(f) + 0x200000 < available_space("/")) {
+		printf("file size (B): %ld\n", file_size(f));
+		printf("space (MB): %ld\n", available_space("/")/1024/1024);
+	}
 
 	fclose(f);
 	return 0;
