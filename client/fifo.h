@@ -12,7 +12,7 @@ typedef struct fifo_t {
 
 FIFO *fifo_alloc(unsigned int size);
 void fifo_free(FIFO *fifo);
-unsigned int _fifo_put(FIFO *fifo, fifo_data_t put);
-unsigned int _fifo_get(FIFO *fifo, fifo_data_t *get);
+int _fifo_put(FIFO *fifo, fifo_data_t put);
+int _fifo_get(FIFO *fifo, fifo_data_t *get);
 
 #endif

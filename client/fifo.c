@@ -181,7 +181,7 @@ void fifo_free(FIFO *fifo)
 	free(fifo);
 }
 
-unsigned int _fifo_put(FIFO *fifo, fifo_data_t put)
+int fifo_put(FIFO *fifo, fifo_data_t put)
 {
 	if(fifo->size - fifo->in + fifo->out == 0)
 		return -1;
@@ -197,7 +197,7 @@ unsigned int _fifo_put(FIFO *fifo, fifo_data_t put)
 	return 0;
 }
 
-unsigned int _fifo_get(FIFO *fifo, fifo_data_t *get)
+int fifo_get(FIFO *fifo, fifo_data_t *get)
 {
 	if(fifo->in - fifo->out == 0)
 		return -1;
