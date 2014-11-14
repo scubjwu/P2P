@@ -11,6 +11,7 @@
 #define DEFAULT_QUEUE_LEN		32
 #define FILE_NAME_LEN			256
 #define DOWNLOAD_THRESHOLD	64
+#define SHARE_RATE				10
 
 #define cli_cmd_header_len		(2 * sizeof(unsigned))
 #define msg_header_len	(sizeof(double) + 3 * sizeof(unsigned int) + sizeof(int))
@@ -61,8 +62,10 @@ struct peer_info_t {
 	//if the value of alive equals to PEER_DEAD, then do not reset its value. Just let the peer timeout and be removed
 	unsigned int alive;	
 
-	//the total download pieces from this peer for the job
-	unsigned int download;
+	//the total download pieces this peer has been downloaded from the network = peer.job->c_download
+	size_t p_download;
+	//total pieces this peer has been loaded to the network = peer.job->c_upload
+	size_t p_upload;
 
 	ev_io peerinfo_io;
 	ev_io peer_transreq_io;
@@ -87,7 +90,8 @@ struct download_job_t {
 	pthread_cond_t assign_req;
 	pthread_cond_t assign_rep;
 
-	unsigned int upload;	//for choke algorithm
+	size_t c_download;	//total pieces download by client
+	size_t c_upload;			//total pieces uploaded by client
 	
 	unsigned int peer_num;
 	struct list_head peer_list;

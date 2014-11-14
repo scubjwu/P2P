@@ -28,6 +28,7 @@ unsigned int ID;
 struct pmsg_t P2P_MSG_OUT;
 struct pmsg_t P2P_MSG_IN;
 struct list_head JOBS;
+char file_info[512];
 
 extern int errno;
 
@@ -37,6 +38,16 @@ struct ev_loop *loop;
 {							\
 	close((watcher)->fd);		\
 	ev_io_stop(loop, watcher);	\
+}
+
+#define filemap_update_req(job)				\
+{							\
+	pthread_mutex_lock(&(job)->assign_lock);	\
+	(job)->piece_update = 1;			\
+	pthread_cond_signal(&(job)->assign_req);	\
+	while((job)->piece_update == 1)			\
+		pthread_cond_wait(&(job)->assign_rep, &(job)->assign_lock);		\
+	pthread_mutex_unlock(&(job)->assign_lock);		\
 }
 
 int file_check_fn(EV_P_ ev_io *w);
@@ -239,12 +250,65 @@ void accept_cli_cb(EV_P_ ev_io *w, int events)
 
 int peer_keepalive_fn(EV_P_ ev_io *w)
 {
-//TODO: handle peer keep-alive msg on client listening port. reset alive value to 0...
+// handle peer keep-alive msg on client listening port. reset alive value to 0...
 // update the finished pieces info and write back to the tmp file for download restore
 // do not reset alive value to 0 if it already equals to PEER_DEAD
 // 1. file_id 2. file_bitmap 3. peer upload capacity
+	
+	struct peer_info_t *ptr;
+	ptr= container_of(w, struct peer_info_t, peerinfo_io);
 
+	struct download_job_t *job = ptr->job;
+	
+	ssize_t read;
+	int dlen = P2P_MSG_IN.len;
+	char data[dlen];
+	read = socket_read(w->fd, data, dlen);
+	if(read == 0 || read == -1 || read != dlen) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
 
+		printf("%s recv msg from server error?\n", __func__);
+		return -1;
+	}
+
+	char file_id[MD5_LEN] = {0};
+	memcpy(file_id, data, MD5_LEN);
+
+	size_t download;
+	memcpy(&download, data + MD5_LEN, sizeof(size_t));
+
+	size_t upload;
+	memcpy(&upload, data + MD5_LEN + sizeof(size_t), sizeof(size_t));
+	
+
+	char file_map[job->map_len];
+	memcpy(file_map, data + MD5_LEN + 2 * sizeof(size_t), job->map_len);
+
+	if(strcmp(file_id, job->file_id) || ptr->alive == PEER_DEAD)
+		return -1;
+	
+	ptr->p_download = download;
+	ptr->p_upload = upload;
+	ptr->alive = 0;
+	
+	if(strcmp(file_map, ptr->peer_filemap)) {
+		strcpy(ptr->peer_filemap, file_map);
+		
+		filemap_update_req(job);
+	}
+
+	//only write back info to file here...
+	size_t len = MD5_LEN + sizeof(off_t) + sizeof(unsigned int);
+	memcpy(file_info + len, job->file_map, job->map_len);
+	len += job->map_len;
+	if(fileinfo_wb(job->fd, file_info, len, job->size) != len) {
+		printf("file info write back error. (%s)\n", strerror(errno));
+		ptr->alive = PEER_DEAD;
+		return -1;
+	}
+
+	return 0;
 }
 
 void trans_REQ(EV_P_ ev_io *w, int events)
@@ -342,27 +406,9 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 		return -1;
 	}
 	
-	int flag = 0;
-	if(ptr->peer_filemap == NULL) {
-		ptr->peer_filemap = (char *)calloc(job->map_len, sizeof(unsigned char));
-		strcpy(ptr->peer_filemap, file_map);
-		flag = 1;
-	}
-	else if(strcmp(ptr->peer_filemap, file_map)) {
-		strcpy(ptr->peer_filemap, file_map);
-		flag = 1;
-	}
-
-	if(flag == 1) {
-		pthread_mutex_lock(&job->assign_lock);
-
-		job->piece_update = 1;
-		pthread_cond_signal(&job->assign_req);
-		while(job->piece_update == 1)
-			pthread_cond_wait(&job->assign_rep, &job->assign_lock);
-
-		pthread_mutex_unlock(&job->assign_lock);	
-	}
+	ptr->peer_filemap = (char *)calloc(job->map_len, sizeof(unsigned char));
+	strcpy(ptr->peer_filemap, file_map);
+	filemap_update_req(job);
 
 	ev_io_init(&(ptr->peer_transrep_io), trans_REP, data_fd, EV_READ);
 	ev_io_init(&(ptr->peer_transreq_io), trans_REQ, data_fd, EV_WRITE);
@@ -394,6 +440,19 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
 }
 
+void build_peerinfo_msg(unsigned int type, char *fid, unsigned char *file_map, size_t download, size_t upload)
+{
+	int map_len = strlen(file_map);
+	P2P_MSG_OUT.type = type;
+	P2P_MSG_OUT.len = MD5_LEN + 2 * sizeof(size_t) + map_len;
+
+	char *p = P2P_MSG_OUT.content;
+	memcpy(p, fid, MD5_LEN);
+	memcpy(p + MD5_LEN, &download, sizeof(size_t));
+	memcpy(p + MD5_LEN + sizeof(size_t), &upload, sizeof(size_t));
+	memcpy(p + MD5_LEN + 2 * sizeof(size_t), file_map, map_len);
+}
+
 void peer_keepalive(EV_P_ ev_timer *w, int events)
 {
 //send keepalive msg to peer
@@ -404,30 +463,13 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 	if(ptr->alive > KEEPALIVE_TIMEOUT) {
 //TODO: if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we need to remove this peer	
 	}
-	
-	P2P_MSG_OUT.type = 0x05;
-	P2P_MSG_OUT.len = MD5_LEN + job->map_len;
-	
-	char *p = P2P_MSG_OUT.content;
-	memcpy(p, job->file_id, MD5_LEN);
-	memcpy(p + MD5_LEN, job->file_map, job->map_len);
 
 	ptr->alive++;
+	build_peerinfo_msg(0x05, job->file_id, job->file_map, job->c_download, job->c_upload);
 	if(socket_write(ptr->peerinfo_io.fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
 		ev_fd_close(&(ptr->peerinfo_io));
 		return;
 	}
-}
-
-void build_peer_connreq(char *fid, unsigned char *file_map)
-{
-	int map_len = strlen(file_map);
-	P2P_MSG_OUT.type = 0x03;
-	P2P_MSG_OUT.len = MD5_LEN + map_len;
-
-	char *p = P2P_MSG_OUT.content;
-	memcpy(p, fid, MD5_LEN);
-	memcpy(p + MD5_LEN, file_map, map_len);
 }
 
 void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_job_t *job)
@@ -446,12 +488,13 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 	ptr->peer_filemap = NULL;
 	ptr->choke = 0;
 	ptr->alive = 0;
-	ptr->download = 0;
+	ptr->p_download = 0;
+	ptr->p_upload = 0;
 	
 	ev_io_init(&(ptr->peerinfo_io), peerinfo_cb, peerinfo_fd, EV_READ);
 	ev_io_start(loop, &(ptr->peerinfo_io));
 
-	build_peer_connreq(fid, job->file_map);
+	build_peerinfo_msg(0x03, fid, job->file_map, job->c_download, job->c_upload);
 	if(socket_write(peerinfo_fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
 		perror("failed to make connection with peer.\n");
 		ev_fd_close(&(ptr->peerinfo_io));
@@ -531,6 +574,12 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 	
 	char fid[MD5_LEN];
 	memcpy(fid, data, MD5_LEN);
+
+	struct download_job_t *job = find_job(fid);
+	if(job == NULL) {
+		printf("srv keepalive msg error. No such file id\n");
+		return -1;
+	}
 	
 	build_csrv_keepalive(fid);
 	if(socket_write(w->fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0)
@@ -542,7 +591,6 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 	struct peer_list_t peers[peer_num];
 	memcpy(peers, data + MD5_LEN, peer_num * sizeof(struct peer_list_t));
 
-	struct download_job_t *job = find_job(fid);
 	int i;
 	for(i=0; i<peer_num; i++) {
 		if(find_peer(&(job->peer_list), peers[i].cid) == false)
@@ -556,41 +604,31 @@ void *assign_piece(void *arg)
 	
 	struct download_job_t *job = (struct download_job_t *)arg;
 
-	unsigned int p_num = job->map_len * 8;
+	size_t p_num = job->map_len * 8;
 	struct piece_info_t *pc = (struct piece_info_t *)calloc(p_num, sizeof(struct piece_info_t));
 	struct peer_info_t *ptr;
 	unsigned char *bitmap;
 	off_t *res = NULL;
+	size_t bitn, cur, average_p;
+	average_p = p_num / job->peer_num;
 
 	for(;;) {
+		int cn;
+		size_t i;
+		bitn = 0; cur = 0;
+		bitmap = job->file_map;
+		
 		pthread_mutex_lock(&job->assign_lock);
-
 		while(job->piece_update == 0)
 			pthread_cond_wait(&job->assign_req, &job->assign_lock);
 
-			list_for_each_entry(ptr, &job->peer_list, list) {
-				ptr->piece_queue->in = ptr->piece_queue->out = 0;
-				qsort(ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
-
-				if(ptr->choke && ptr->download > DOWNLOAD_THRESHOLD) {
-					if(ptr->plist_len == ptr->plist_cur) {
-						ptr->piece_queue->size = ptr->piece_queue->size / 2;
-						if(ptr->piece_queue->size < 4)
-							ptr->piece_queue->size = 4;
-					
-						ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size);
-					}
-					else if(FIFO_EMPTY(ptr->piece_queue)) {
-						ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size + 4);
-						ptr->choke = 0;
-						ev_io_start(loop, &ptr->peer_transreq_io);
-					}
-				}
-			}
-
-		//get pieces stat
-		int i, cn, cur = 0;
-		bitmap = job->file_map;
+		
+		list_for_each_entry(ptr, &job->peer_list, list) {
+			ptr->piece_queue->in = ptr->piece_queue->out = 0;
+			qsort(ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
+		}
+		
+		//get pieces stat	
 		for(i=0; i<p_num; i++) {
 			cn = 0;
 			if(get_bit(bitmap, i) == 1)
@@ -614,6 +652,33 @@ void *assign_piece(void *arg)
 		}
 		qsort(pc, cur, sizeof(struct piece_info_t), piece_cmp);
 		
+		//choke method
+		list_for_each_entry(ptr, &job->peer_list, list) {
+			if(ptr->choke && ptr->p_download > DOWNLOAD_THRESHOLD) {
+				if(ptr->plist_len == ptr->plist_cur) {
+					ptr->piece_queue->size = ptr->piece_queue->size / 2;
+					if(ptr->piece_queue->size < 4)
+						ptr->piece_queue->size = 4;
+					
+					ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size);
+				}
+				else if(FIFO_EMPTY(ptr->piece_queue)) {
+					ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size + 4);
+					ptr->choke = 0;
+					ev_io_start(loop, &ptr->peer_transreq_io);
+				}
+			}
+
+			if(ptr->p_download > average_p
+				&& ptr->p_download / ptr->p_upload > SHARE_RATE) {
+				ptr->piece_queue->size = ptr->piece_queue->size / 2;
+				if(ptr->piece_queue->size < 4)
+					ptr->piece_queue->size = 4;
+					
+				ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size);
+			}
+		}
+		
 		//assign pieces
 		for(i=0; i<cur; i++) {
 			int flag = 0;
@@ -629,8 +694,7 @@ void *assign_piece(void *arg)
 		}
 
 		job->piece_update = 0;
-		pthread_cond_signal(&job->assign_rep);
-		
+		pthread_cond_signal(&job->assign_rep);	
 		pthread_mutex_unlock(&job->assign_lock);
 	}
 }
@@ -651,7 +715,8 @@ struct download_job_t *add_download_job(char *name, char *fid, off_t size, unsig
 	pthread_cond_init(&new->assign_req, NULL);
 	pthread_cond_init(&new->assign_rep, NULL);
 
-	new->upload = 0;
+	new->c_download = 0;
+	new->c_upload = 0;
 	new->peer_num = peer_num;
 	INIT_LIST_HEAD(&(new->peer_list));
 	
@@ -659,6 +724,11 @@ struct download_job_t *add_download_job(char *name, char *fid, off_t size, unsig
 
 	pthread_t tid;
 	pthread_create(&tid, NULL, assign_piece, new);
+
+	//init file_info buff. fullfill file_info everytime when recv keepalive msg from peer and write it back to tmp file
+	memcpy(file_info, fid, MD5_LEN);
+	memcpy(file_info + MD5_LEN, &size, sizeof(off_t));
+	memcpy(file_info + MD5_LEN + sizeof(off_t), &map_len, sizeof(unsigned int));
 
 	return new;
 }
@@ -757,7 +827,7 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 int client_keepalive_fn(EV_P_ ev_io *w)
 {
 //TODO: handle client keepalive detect msg on peer listening port
-//reply keepalive msg with: 1. file_id 2. peer upload capacity 3. file_bitmap
+//reply keepalive msg with: 1. file_id 2. file_bitmap 3. peer upload capacity
 }
 
 void peer_req_cb(EV_P_ ev_io *w, int events)
