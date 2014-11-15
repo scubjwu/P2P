@@ -18,6 +18,7 @@ double VERSION = 0.01;
 int CLIENT_LISTEN_PORT = 60010;
 int MIN_TRANS_PORT = 33000;
 int MAX_TRANS_PORT = 61000;
+char *port_range;
 int INTERFACE_ID = 1;
 char SERVER_IP[IPV4_ADDR_LEN] = G_SRV_IP_ADDR;
 char CLIENT_IP[IPV4_ADDR_LEN] = "0.0.0.0";
@@ -158,6 +159,8 @@ void load_config_file(char *file)
 		sprintf(SHARE_DIR, "%s/Download/", cmd_system("echo $HOME"));
 	}
 
+	port_range = (char *)calloc(MAX_TRANS_PORT - MIN_TRANS_PORT, sizeof(char));
+
 	printf("%d %d %d %d %s %s %s\n", CLIENT_LISTEN_PORT, MIN_TRANS_PORT, MAX_TRANS_PORT, INTERFACE_ID, SERVER_IP, CLIENT_IP, SHARE_DIR);
 }
 
@@ -175,7 +178,9 @@ void client_exit(int para)
 
 void init_var(void)
 {
-	//TODO: init all needed GLOBAL variables. eg: the table maintain the status of each sharing file
+	//init all needed GLOBAL variables. eg: the table maintain the status of each sharing file
+	load_config_file(CONFIG_FILE);
+	
 	ID = getclientID();
 
 	P2P_MSG_OUT.magic = MAGIC_NUM;
@@ -346,7 +351,7 @@ void trans_REQ_cb(EV_P_ ev_io *w, int events)
 	fifo_get(ptr->piece_queue, &tmp);
 
 	P2P_MSG_OUT.type = 0x07;
-	P2P_MSG_OUT.cid = ptr->peer_id;
+	P2P_MSG_OUT.pid = ptr->peer_id;
 	P2P_MSG_OUT.len = MD5_LEN + sizeof(off_t);
 	char *buf = P2P_MSG_OUT.content;
 	
@@ -382,7 +387,7 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
 	if(read != len ||
 		P2P_MSG_IN.magic != MAGIC_NUM ||
-		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.pid != ID ||
 		P2P_MSG_IN.len == 0) {
 		printf("trans rep msg error\n");
 		goto REP_ERROR;
@@ -540,7 +545,7 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
 	if(read != len ||
 		P2P_MSG_IN.magic != MAGIC_NUM ||
-		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.pid != ID ||
 		P2P_MSG_IN.len == 0) {
 		ev_fd_close(w);
 		return;
@@ -563,7 +568,7 @@ void build_peerinfo_msg(unsigned int type, unsigned int id, char *fid, unsigned 
 {
 	int map_len = strlen(file_map);
 	P2P_MSG_OUT.type = type;
-	P2P_MSG_OUT.cid = id;
+	P2P_MSG_OUT.pid = id;
 	P2P_MSG_OUT.len = MD5_LEN + 2 * sizeof(size_t) + map_len;
 
 	char *p = P2P_MSG_OUT.content;
@@ -941,7 +946,7 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 	if(read != len || 
 		//sanity check the msg header...
 		P2P_MSG_IN.magic != MAGIC_NUM || 
-		P2P_MSG_IN.cid != ID || 
+		P2P_MSG_IN.pid != ID || 
 		P2P_MSG_IN.version == 0.) {
 		printf("srv msg error?\n");
 	//keep the client_srv socket open...
@@ -961,16 +966,100 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
 }
 
+unsigned int datatrans_port(void)
+{
+	int i;
+	for(i=0; i<MAX_TRANS_PORT - MIN_TRANS_PORT; i++) {
+		if(port_range[i] == 0) {
+			port_range[i] = 1;
+			return i;
+		}
+	}
+	return 0;
+}
+
+void data_send_cb(EV_P_ ev_io *w, int events)
+{
+//TODO: recv data trans req msg. send the req data back to client (0x08)
+}
+
+void accept_datareq_cb(EV_P_ ev_io *w, int events)
+{
+	ev_io *data_trans_io;
+	int fd;
+	fd = accept(w->fd, NULL, NULL);
+	if(fd == -1 &&
+		errno != EAGAIN &&
+		errno != EWOULDBLOCK) {
+		printf("peer accept error: %s\n", strerror(errno));
+		//TODO: send back accept error msg to client???
+		goto ACPT_END;
+	}
+
+	set_socketopt(fd);
+	set_blocking(fd, false);
+
+	data_trans_io = (ev_io *)malloc(sizeof(ev_io));
+	ev_io_init(data_trans_io, data_send_cb, fd, EV_READ);
+	ev_io_start(loop, data_trans_io);
+
+ACPT_END:
+	ev_fd_close(w);
+	_free(w);
+}
+
+int client_keepalive_fn(EV_P_ ev_io *w)
+{
+//handle client keepalive detect msg on peer listening port
+//reply keepalive msg with: 1. file_id 2. file_bitmap 3. peer upload capacity
+
+	ssize_t read;
+	char file_id[MD5_LEN];
+	char *p;
+	struct download_job_t *job;
+
+	read = socket_read(w->fd, file_id, MD5_LEN);
+	if(read == 0 || read == -1 || read != MD5_LEN) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+
+		printf("%s socket read error?\n", __func__);
+		goto CKEEPALIVE_END;
+	}
+
+	job = find_job(file_id);
+	if(job == NULL) {
+	//TODO: construct error msg and send back to client
+	
+		goto CKEEPALIVE_END;
+	}
+
+	build_peerinfo_msg(0x06, P2P_MSG_IN.cid, file_id, job->file_map, job->c_download, job->c_upload);
+	if(socket_write(w->fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0)
+		goto CKEEPALIVE_END;
+
+	return 0;
+
+CKEEPALIVE_END:
+	ev_fd_close(w);
+	_free(w);
+	return -1;
+}
+
 int client_conn_req_fn(EV_P_ ev_io *w)
 {
-//TODO: handle client conn req msg on peer listening port
+// handle client conn req msg on peer listening port
 // send reply with: 1. file_id 2. peer ip 3. peer data trans port 4. file_bitmap
 // setup data trans socket on peer to wait client data trans req
 
 	ssize_t read;
-	int i;
 	size_t dlen = P2P_MSG_IN.len;
 	char data[dlen];
+	char file_id[MD5_LEN];
+	struct download_job_t *job;
+	struct peer_info_t *ptr;
+	size_t download, upload;
+	unsigned int port;
 	
 	read = socket_read(w->fd, data, dlen);
 	if(read == 0 || read == -1 || read != dlen) {
@@ -978,19 +1067,73 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 			printf("socket read error: %s\n", strerror(errno));
 
 		printf("%s socket read error?\n", __func__);
-		goto CREQ_ERROR;
+		ev_fd_close(w);
+		_free(w);
+		return -1;
 	}
 
-CREQ_ERROR:
-	ev_fd_close(w);
-	_free(w);
-	return -1;
-}
+	
+	memcpy(file_id, data, MD5_LEN);
+	memcpy(&download, data + MD5_LEN, sizeof(size_t));
+	memcpy(&upload, data + MD5_LEN + sizeof(size_t), sizeof(size_t));
 
-int client_keepalive_fn(EV_P_ ev_io *w)
-{
-//TODO: handle client keepalive detect msg on peer listening port
-//reply keepalive msg with: 1. file_id 2. file_bitmap 3. peer upload capacity
+	job = find_job(file_id);
+	if(job == NULL) {
+	//TODO: construct error msg and send back to client
+	
+		ev_fd_close(w);
+		_free(w);
+		return -1;
+	}
+
+	char file_map[job->map_len];
+	memcpy(file_map, data + MD5_LEN + 2 * sizeof(size_t), job->map_len);
+
+	//assign a random port for data trans
+	port = datatrans_port();
+	if(port == 0) {
+	//TODO: send error back. no port available on peer for data trans...
+
+		ev_fd_close(w);
+		_free(w);
+		return -1;
+	}
+
+	//setup data trans socket to wait incoming connection
+	int data_fd;
+	data_fd = open_socket_in(port, CLIENT_IP); 
+	if(data_fd == -1) {
+	//TODO: setup recv socket error. send back error msg
+
+		ev_fd_close(w);
+		_free(w);
+		return -1;
+	}
+
+	ev_io *data_send_io = (ev_io *)malloc(sizeof(ev_io));
+	ev_io_init(data_send_io, accept_datareq_cb, data_fd, EV_READ);
+	ev_io_start(loop, data_send_io);
+
+	//prepare reply
+	P2P_MSG_OUT.pid = P2P_MSG_IN.cid;
+	P2P_MSG_OUT.type = 0x04;
+	P2P_MSG_OUT.len = MD5_LEN + IPV4_ADDR_LEN + sizeof(unsigned int) + job->map_len;
+
+	char *p = P2P_MSG_OUT.content;
+	memcpy(p, file_id, MD5_LEN);
+	memcpy(p + MD5_LEN, CLIENT_IP, IPV4_ADDR_LEN);
+	memcpy(p + MD5_LEN + IPV4_ADDR_LEN, &port, sizeof(unsigned int));
+	memcpy(p + MD5_LEN + IPV4_ADDR_LEN + sizeof(unsigned int), job->file_map, job->map_len);	
+	if(socket_write(w->fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
+		ev_fd_close(w);
+		_free(w);
+		ev_fd_close(data_send_io);
+		_free(data_send_io);
+		return -1;	
+	}
+
+	//Do not care if we have this client in local peer list or not. just wait for next peerlist update from server...
+	return 0;
 }
 
 void peer_req_cb(EV_P_ ev_io *w, int events)
@@ -1003,7 +1146,7 @@ void peer_req_cb(EV_P_ ev_io *w, int events)
 	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
 	if(read != len ||
 		P2P_MSG_IN.magic != MAGIC_NUM ||
-		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.pid != ID ||
 		P2P_MSG_IN.len == 0) {
 		//this is client listening port... do not close it. just stop the watcher
 		ev_fd_close(w)
