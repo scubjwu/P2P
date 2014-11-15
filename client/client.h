@@ -6,6 +6,7 @@
 #define UNIX_SOCK_PATH	"/tmp/PP2P.sock"
 #define PEER_KEEPALIVE_TINTER	20	
 #define PIECE_SIZE				0x20000	// 128KB
+#define WB_BUFF_LEN				0x40000	// 256KB. Just be safe...
 #define KEEPALIVE_TIMEOUT		3		// 1 min
 #define PEER_DEAD				999
 #define DEFAULT_QUEUE_LEN		32

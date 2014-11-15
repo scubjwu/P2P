@@ -30,7 +30,7 @@ struct pmsg_t P2P_MSG_OUT;
 struct pmsg_t P2P_MSG_IN;
 struct list_head JOBS;
 char file_info[512];
-char wb_buff[PIECE_SIZE];
+char wb_buff[WB_BUFF_LEN];
 
 int clientCLI_fd;
 int client2srv_fd;
@@ -458,8 +458,12 @@ int write_p2pfile(struct peer_info_t *peer, off_t pos, size_t len)
 	unsigned char *bitmap = peer->job->file_map;
 	size_t p_num = peer->job->map_len * 8;
 
-	if(get_bit(bitmap, pos) == 1 ||
-		pos >= p_num ||
+	if(get_bit(bitmap, pos) == 1) {	//duplicated piece???
+		printf("recv duplicated piece....\n");
+		return 0;
+	}
+
+	if(pos >= p_num ||
 		(pos != p_num - 1 && len != PIECE_SIZE))
 		return -1;
 
@@ -978,9 +982,80 @@ unsigned int datatrans_port(void)
 	return 0;
 }
 
+size_t get_piece_size(char *map, off_t size, off_t id)
+{
+	size_t p_num = strlen(map) * 8;
+	size_t res;
+	
+	if(get_bit(map, id) == 0 || id >= p_num)
+		return 0;
+
+	res = size % PIECE_SIZE;
+	return (res == 0 ? PIECE_SIZE : res);
+}
+
 void data_send_cb(EV_P_ ev_io *w, int events)
 {
-//TODO: recv data trans req msg. send the req data back to client (0x08)
+//recv data trans req msg (0x07). send the req data back to client (0x08)
+
+	ssize_t read;
+	size_t len = msg_header_len + MD5_LEN + sizeof(off_t);
+	char file_id[MD5_LEN] = {0};
+	off_t piece_id;
+	struct download_job_t *job;
+	size_t piece_size;
+	
+	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
+	if(read != len ||
+		P2P_MSG_IN.magic != MAGIC_NUM ||
+		P2P_MSG_IN.pid != ID) {
+		printf("peer read trans req msg error\n");
+		//TODO: send error msg back to client
+
+		goto SEND_ERROR;
+	}
+	
+	memcpy(file_id, P2P_MSG_IN.content, MD5_LEN);
+	memcpy(&piece_id, P2P_MSG_IN.content + MD5_LEN, sizeof(off_t));
+
+	job = find_job(file_id);
+	if(job == NULL) {
+	//TODO: send error msg back to client
+
+		goto SEND_ERROR;
+	}
+
+	piece_size = get_piece_size(job->file_map, job->size, piece_id);
+	if(piece_size == 0) {
+	//TODO: error piece size. send back error msg
+
+		goto SEND_ERROR;
+	}
+
+	if(file_read(job->fd, wb_buff + msg_header_len + MD5_LEN + sizeof(off_t), 
+				piece_size, piece_id) != piece_size) {
+	//TODO: file read error. send back error msg
+
+		goto SEND_ERROR;
+	}
+
+	P2P_MSG_OUT.pid = P2P_MSG_IN.cid;
+	P2P_MSG_OUT.type = 0x08;
+	P2P_MSG_OUT.len = MD5_LEN + sizeof(off_t) + piece_size;
+	memcpy(wb_buff, &P2P_MSG_OUT, msg_header_len);
+	memcpy(wb_buff + msg_header_len, file_id, MD5_LEN);
+	memcpy(wb_buff + msg_header_len + MD5_LEN, &piece_id, sizeof(off_t));
+
+	if(socket_write(w->fd, wb_buff, msg_header_len + P2P_MSG_OUT.len) <= 0) {
+		goto SEND_ERROR;
+	}
+
+	job->c_upload++;
+	return;
+	
+SEND_ERROR:
+	ev_fd_close(w);
+	_free(w);
 }
 
 void accept_datareq_cb(EV_P_ ev_io *w, int events)
