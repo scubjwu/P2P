@@ -310,8 +310,12 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	
 	if(strcmp(file_map, ptr->peer_filemap)) {
 		strcpy(ptr->peer_filemap, file_map);
-		
-		filemap_update_req(job);
+		ptr->new_piece = 1;
+		//check if we need to do the reassignement...
+		if(ptr->choke != 2) {
+			filemap_update_req(job);
+			ptr->new_piece = 0;
+		}
 	}
 
 	//only write back info to file here...
@@ -340,20 +344,58 @@ void trans_REQ_cb(EV_P_ ev_io *w, int events)
 
 	struct peer_info_t *ptr;
 	ptr = container_of(w, struct peer_info_t, peer_transreq_io);
+	struct download_job_t *job = ptr->job;
+	fifo_data_t tmp;
+	char *buf;
 
-	if(FIFO_EMPTY(ptr->piece_queue) || ptr->plist_len == ptr->plist_cur) {
-		ptr->choke = 1;
+	// 1. if the pending list is full, do not send any new data req. choke the peer and wait
+	if(ptr->plist_len == ptr->plist_cur) {
+		ptr->choke = 2;		//pending full choke
+		ev_io_stop(EV_A_ w);
+		return;
+	}
+	// 2. if the pending list is not full but the queue is empty. try get new piece assignment
+	else if(FIFO_EMPTY(ptr->piece_queue)) {
+		//check if we have new pieces assign to queue
+		int i, flag = 0;
+		for(i=job->pc_cur; i<job->pc_len; i++) {
+			if(job->pc[i].assign == 0 && 
+				get_bit(ptr->peer_filemap, job->pc[i].index)) {
+				if(fifo_put(ptr->piece_queue, &(job->pc[i])) == -1)
+					break;
+
+				job->pc[i].assign = 1;
+				flag = 1;
+				if(i == job->pc_cur)
+					job->pc_cur++;
+			}
+		}
+		//if no piece could be assigned but the map could be updated
+		if(flag == 0) {
+			if(ptr->new_piece) {
+				ptr->choke = 1;	//queue empty
+				filemap_update_req(job);
+				ptr->new_piece = 0;
+			}
+			else {
+				ptr->choke = 3;		//piece lack choke
+				ev_io_stop(EV_A_ w);
+				return;
+			}
+		}
+	}
+
+	
+	if(fifo_get(ptr->piece_queue, &tmp) == -1) {
+		ptr->choke = 3;		//piece lack choke
 		ev_io_stop(EV_A_ w);
 		return;
 	}
 
-	fifo_data_t tmp;
-	fifo_get(ptr->piece_queue, &tmp);
-
 	P2P_MSG_OUT.type = 0x07;
 	P2P_MSG_OUT.pid = ptr->peer_id;
 	P2P_MSG_OUT.len = MD5_LEN + sizeof(off_t);
-	char *buf = P2P_MSG_OUT.content;
+	buf = P2P_MSG_OUT.content;
 	
 	memcpy(buf, ptr->job->file_id, MD5_LEN);
 	memcpy(buf + MD5_LEN, &((struct piece_info_t *)tmp)->index, sizeof(off_t));
@@ -370,6 +412,7 @@ void trans_REQ_cb(EV_P_ ev_io *w, int events)
 	pos = bsearch(&key, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
 	*pos = ((struct piece_info_t *)tmp)->index;
 	ptr->plist_cur++;
+	return;
 }
 
 void trans_REP_cb(EV_P_ ev_io *w, int events)
@@ -442,10 +485,14 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 	ptr->peer_trans_cnt++;
 	job->c_download++;
 	
-	if(ptr->choke && !FIFO_EMPTY(ptr->piece_queue)) {
+	if(ptr->choke == 2 && 
+		!FIFO_EMPTY(ptr->piece_queue) &&
+		ptr->plist_len - ptr->plist_cur >= FIFO_LEN(ptr->piece_queue)) {
 		ptr->choke = 0;
 		ev_io_start(loop, &ptr->peer_transreq_io);
 	}
+	
+	return;
 
 REP_ERROR:
 	ev_fd_close(w)
@@ -524,7 +571,7 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 	
 	ptr->peer_filemap = (char *)calloc(job->map_len, sizeof(unsigned char));
 	strcpy(ptr->peer_filemap, file_map);
-	filemap_update_req(job);
+	ptr->new_piece = 1;
 
 	ev_io_init(&(ptr->peer_transrep_io), trans_REP_cb, data_fd, EV_READ);
 	ev_io_init(&(ptr->peer_transreq_io), trans_REQ_cb, data_fd, EV_WRITE);
@@ -591,6 +638,7 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 
 	if(ptr->alive > KEEPALIVE_TIMEOUT) {
 //TODO: if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we need to remove this peer	
+		
 	}
 
 	ptr->alive++;
@@ -615,6 +663,7 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 	ptr->job = job;
 	ptr->peer_id = peer.cid;
 	ptr->peer_filemap = NULL;
+	ptr->new_piece = 0;
 	ptr->choke = 0;
 	ptr->alive = 0;
 	ptr->p_download = 0;
@@ -737,15 +786,16 @@ void *assign_piece(void *arg)
 	struct download_job_t *job = (struct download_job_t *)arg;
 
 	size_t p_num = job->map_len * 8;
-	struct piece_info_t *pc = (struct piece_info_t *)calloc(p_num, sizeof(struct piece_info_t));
+	job->pc = (struct piece_info_t *)calloc(p_num, sizeof(struct piece_info_t));
+	job->pc_len = 0;
+	job->pc_cur = 0;
 	struct peer_info_t *ptr;
 	unsigned char *bitmap;
-	off_t *res = NULL;
 	size_t bitn, cur, average_p;
 	average_p = p_num / job->peer_num;
 
 	for(;;) {
-		int cn;
+		int cn, finished = 1;
 		size_t i;
 		bitn = 0; cur = 0;
 		bitmap = job->file_map;
@@ -768,12 +818,12 @@ void *assign_piece(void *arg)
 			if(get_bit(bitmap, i) == 1)
 				continue;
 
+			finished = 0;
 			list_for_each_entry(ptr, &job->peer_list, list) {
 				if(ptr->alive == PEER_DEAD)
 					continue;
 				//check if it is in the pending list
-				res = bsearch(&i, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
-				if(res) {
+				if(bsearch(&i, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp)) {
 					cn = 0;
 					break;
 				}
@@ -782,27 +832,38 @@ void *assign_piece(void *arg)
 			if(cn == 0)
 				continue;
 			
-			pc[cur].index = i;
-			pc[cur].count = cn;
+			job->pc[cur].index = i;
+			job->pc[cur].assign = 1;
+			job->pc[cur].count = cn;
 			cur++;
 		}
-		qsort(pc, cur, sizeof(struct piece_info_t), piece_cmp);
+		if(finished == 1) {
+		//TODO: job finished....
+		}
+		
+		qsort(job->pc, cur, sizeof(struct piece_info_t), piece_cmp);
+		job->pc_len = cur;
+		job->pc_cur = 0;
 		
 		//choke method
 		list_for_each_entry(ptr, &job->peer_list, list) {
 			if(ptr->alive == PEER_DEAD)
 				continue;
-		/* if we have got certain pieces and the peer is choked, then:
-		*	1. if the peer is choked because of pending list is full, reduce the assign queue len.
-		*	2. if the peer is choked beacuse of the assign queue is empty and the len of pending list is low, enlargethe queue len.
-		*/
+			
+			/* if we have got certain pieces and the peer is choked, then:
+			*	1. if the peer is choked because of pending list is full, reduce the assign queue len.
+			*	2. if the peer is choked beacuse of the assign queue is empty and the len of pending list is low, enlargethe queue len.
+			*/
 			if(ptr->choke && job->c_download > DOWNLOAD_THRESHOLD) {
-				if(ptr->plist_len == ptr->plist_cur) {
+				if(ptr->choke == 2) {
 					queue_shrank(ptr->piece_queue);
 				}
-				else if(FIFO_EMPTY(ptr->piece_queue) 
-					&& ptr->plist_cur < DEFAULT_QUEUE_LEN/2) {
+				else if(ptr->choke == 1 && ptr->plist_cur < DEFAULT_QUEUE_LEN/2) {
 					ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size + 4);
+					ptr->choke = 0;
+					ev_io_start(loop, &ptr->peer_transreq_io);
+				}
+				else if(ptr->choke == 3 && ptr->new_piece) {
 					ptr->choke = 0;
 					ev_io_start(loop, &ptr->peer_transreq_io);
 				}
@@ -832,8 +893,10 @@ void *assign_piece(void *arg)
 			list_for_each_entry(ptr, &job->peer_list, list) {
 				if(ptr->alive == PEER_DEAD)
 					continue;
-				if(get_bit(ptr->peer_filemap, pc[i].index) && 
-					fifo_put(ptr->piece_queue, &pc[i]) == 0) {
+				if(get_bit(ptr->peer_filemap, job->pc[i].index) && 
+					fifo_put(ptr->piece_queue, &(job->pc[i])) == 0) {
+					job->pc[i].assign = 1;
+					job->pc_cur++;
 					flag = 1;
 					break;
 				}
@@ -858,7 +921,7 @@ struct download_job_t *add_download_job(char *name, char *fid, off_t size, unsig
 	new->size = size;
 	new->map_len = map_len;
 	new->file_map = (unsigned char *)calloc(map_len, sizeof(unsigned char));
-
+	
 	new->piece_update = 0;
 	pthread_mutex_init(&new->assign_lock, NULL);
 	pthread_cond_init(&new->assign_req, NULL);

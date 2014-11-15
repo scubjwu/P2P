@@ -10,8 +10,9 @@ typedef struct fifo_t {
 	unsigned int out;	/* data is extracted from off. (out % size) */
 } FIFO;
 
-#define FIFO_FULL(fifo)	(fifo->size - fifo->in + fifo->out == 0)
-#define FIFO_EMPTY(fifo)	(fifo->in - fifo->out == 0)
+#define FIFO_FULL(fifo)	((fifo)->size - (fifo)->in + (fifo)->out == 0)
+#define FIFO_EMPTY(fifo)	((fifo)->in - (fifo)->out == 0)
+#define FIFO_LEN(fifo)		((fifo)->in - (fifo)->out)
 
 FIFO *fifo_alloc(unsigned int size);
 FIFO *fifo_realloc(FIFO *src, unsigned int size);

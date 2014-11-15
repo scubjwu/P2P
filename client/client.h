@@ -47,6 +47,7 @@ struct peer_info_t {
 	
 	unsigned int peer_id;
 	unsigned char *peer_filemap;
+	unsigned int new_piece;
 
 //assign file pieces into this queue for trans req.
 	FIFO *piece_queue;
@@ -90,6 +91,10 @@ struct download_job_t {
 	unsigned int map_len;
 	char *file_map;
 
+	struct piece_info_t *pc;
+	size_t pc_len;		//total length of pc
+	size_t pc_cur;		//current pos of unassigned pc 
+
 	unsigned int piece_update;	// 1: piece array need to update;
 	pthread_mutex_t assign_lock;
 	pthread_cond_t assign_req;
@@ -104,6 +109,7 @@ struct download_job_t {
 
 struct piece_info_t {
 	off_t index;
+	int assign;
 	unsigned int count;		//for rarest first algorithm
 };
 
