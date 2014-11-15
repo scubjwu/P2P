@@ -14,7 +14,7 @@
 #define SHARE_RATE				20
 
 #define cli_cmd_header_len		(2 * sizeof(unsigned))
-#define msg_header_len	(sizeof(double) + 3 * sizeof(unsigned int) + sizeof(size_t))
+#define msg_header_len	(sizeof(double) + 4 * sizeof(unsigned int) + sizeof(size_t))
 
 struct cli_cmd_t {
 	unsigned type;
@@ -24,6 +24,7 @@ struct cli_cmd_t {
 
 struct pmsg_t {
 	unsigned int magic;
+	unsigned int error;
 	unsigned int type;
 	unsigned int cid;
 	size_t len;

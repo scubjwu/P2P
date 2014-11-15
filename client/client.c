@@ -31,6 +31,10 @@ struct list_head JOBS;
 char file_info[512];
 char wb_buff[PIECE_SIZE];
 
+int clientCLI_fd;
+int client2srv_fd;
+int p2p_listen_fd;
+
 extern int errno;
 
 struct ev_loop *loop;
@@ -177,6 +181,7 @@ void init_var(void)
 	P2P_MSG_OUT.magic = MAGIC_NUM;
 	P2P_MSG_OUT.version = VERSION;
 	P2P_MSG_OUT.cid = ID;
+	P2P_MSG_OUT.error = 0x0;
 
 	INIT_LIST_HEAD(&JOBS);
 }
@@ -234,7 +239,7 @@ void cli_cmd_cb(EV_P_ ev_io *w, int events)
 		return;
 	}
 
-	parse_cli_cmd(w->fd, data.type, data.cmd);
+	parse_cli_cmd(client2srv_fd, data.type, data.cmd);
 }
 
 void accept_cli_cb(EV_P_ ev_io *w, int events)
@@ -266,36 +271,33 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	
 	struct peer_info_t *ptr;
 	ptr= container_of(w, struct peer_info_t, peerinfo_io);
-
 	struct download_job_t *job = ptr->job;
-	
 	ssize_t read;
-	size_t dlen = P2P_MSG_IN.len;
+	size_t dlen, download, upload, len;
 	char data[dlen];
+	char file_id[MD5_LEN] = {0};
+	char file_map[job->map_len];
+
+	if(ptr->alive == PEER_DEAD)
+		goto KEEPALIVE_ERROR;
+
+	dlen = P2P_MSG_IN.len;
 	read = socket_read(w->fd, data, dlen);
 	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 
 		printf("%s recv msg from server error?\n", __func__);
-		return -1;
+		goto KEEPALIVE_ERROR;
 	}
 
-	char file_id[MD5_LEN] = {0};
 	memcpy(file_id, data, MD5_LEN);
-
-	size_t download;
 	memcpy(&download, data + MD5_LEN, sizeof(size_t));
-
-	size_t upload;
 	memcpy(&upload, data + MD5_LEN + sizeof(size_t), sizeof(size_t));
-	
-
-	char file_map[job->map_len];
 	memcpy(file_map, data + MD5_LEN + 2 * sizeof(size_t), job->map_len);
 
-	if(strcmp(file_id, job->file_id) || ptr->alive == PEER_DEAD)
-		return -1;
+	if(strcmp(file_id, job->file_id))
+		goto KEEPALIVE_ERROR;
 	
 	ptr->p_download = download;
 	ptr->p_upload = upload;
@@ -308,16 +310,20 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	}
 
 	//only write back info to file here...
-	size_t len = MD5_LEN + sizeof(off_t) + sizeof(unsigned int);
+	len = MD5_LEN + sizeof(off_t) + sizeof(unsigned int);
 	memcpy(file_info + len, job->file_map, job->map_len);
 	len += job->map_len;
 	if(file_write(job->fd, file_info, len, job->size + 0x400/*1KB safe space*/) != len) {
 		printf("file info write back error. (%s)\n", strerror(errno));
-		ptr->alive = PEER_DEAD;
-		return -1;
+		goto KEEPALIVE_ERROR;
 	}
 
 	return 0;
+
+KEEPALIVE_ERROR:
+	ev_fd_close(w);
+	ptr->alive = PEER_DEAD;
+	return -1;
 }
 
 void trans_REQ_cb(EV_P_ ev_io *w, int events)
@@ -348,6 +354,7 @@ void trans_REQ_cb(EV_P_ ev_io *w, int events)
 	memcpy(buf + MD5_LEN, &((struct piece_info_t *)tmp)->index, sizeof(off_t));
 
 	if(socket_write(ptr->peer_transreq_io.fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
+		ev_fd_close(w);
 		ptr->alive = PEER_DEAD;
 		return;
 	}
@@ -378,7 +385,11 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 		P2P_MSG_IN.cid != ID ||
 		P2P_MSG_IN.len == 0) {
 		printf("trans rep msg error\n");
-		return;
+		goto REP_ERROR;
+	}
+
+	if(P2P_MSG_IN.error) {
+	//TODO: handle error of trans req from peer
 	}
 
 	char file_id[MD5_LEN] = {0};
@@ -389,8 +400,7 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 
 	if(strcmp(file_id, job->file_id)) {
 		printf("wrong file_id of trans rep\n");
-		ptr->alive = PEER_DEAD;
-		return;
+		goto REP_ERROR;
 	}
 
 	qsort(ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
@@ -398,15 +408,13 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 	pos = bsearch(&piece_id, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
 	if(pos == NULL) {
 		printf("wrong file piece of trans rep\n");
-		ptr->alive = PEER_DEAD;
-		return;
+		goto REP_ERROR;
 	}
 
 	len = P2P_MSG_IN.len - MD5_LEN - sizeof(off_t);	//actual data len
 	if(len > PIECE_SIZE) {
 		printf("wrong data len of trans rep\n");
-		ptr->alive = PEER_DEAD;
-		return;
+		goto REP_ERROR;
 	}
 
 	read = socket_read(w->fd, wb_buff, len);
@@ -415,14 +423,12 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 			printf("socket read error: %s\n", strerror(errno));
 
 		printf("%s error?\n", __func__);
-		ptr->alive = PEER_DEAD;
-		return;
+		goto REP_ERROR;
 	}
 
 	if(write_p2pfile(ptr, piece_id, len) == -1) {
 		printf("write back file error?\n");
-		ptr->alive = PEER_DEAD;
-		return;
+		goto REP_ERROR;
 	}
 
 	//update related info
@@ -435,6 +441,11 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 		ptr->choke = 0;
 		ev_io_start(loop, &ptr->peer_transreq_io);
 	}
+
+REP_ERROR:
+	ev_fd_close(w)
+	ptr->alive = PEER_DEAD;
+	return;
 }
 
 int write_p2pfile(struct peer_info_t *peer, off_t pos, size_t len)
@@ -463,47 +474,43 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 	ssize_t read;
 	size_t dlen = P2P_MSG_IN.len;
 	char data[dlen];
+	struct peer_info_t *ptr;
+	struct download_job_t *job;
+	char file_id[MD5_LEN] = {0};
+	char ip[IPV4_ADDR_LEN] = {0};
+	unsigned int port_d;
+	char file_map[job->map_len];
+	int data_fd;
+	
 	read = socket_read(w->fd, data, dlen);
 	if(read == 0 || read == -1 || read != dlen) {
 		if(read == -1)
 			printf("socket read error: %s\n", strerror(errno));
 
 		printf("%s recv msg from peer error?\n", __func__);
-		ev_fd_close(w);
-		return -1;
+		goto REP_ERROR;
 	}
 
-	struct peer_info_t *ptr;
-	ptr= container_of(w, struct peer_info_t, peerinfo_io);
-
-	struct download_job_t *job = ptr->job;
 	
-	char file_id[MD5_LEN] = {0};
+	ptr= container_of(w, struct peer_info_t, peerinfo_io);
+	job = ptr->job;
+	
 	memcpy(file_id, data, MD5_LEN);
-
-	char ip[IPV4_ADDR_LEN] = {0};
 	memcpy(ip, data + MD5_LEN, IPV4_ADDR_LEN);
-
-	unsigned int port_d;
 	memcpy(&port_d, data + MD5_LEN + IPV4_ADDR_LEN, sizeof(unsigned int));
-
-	char file_map[job->map_len];
 	memcpy(file_map, data + MD5_LEN + IPV4_ADDR_LEN + sizeof(unsigned int), job->map_len);
 
-	int data_fd;
 	//TODO: need to use ICE to setup the socket
 	data_fd = open_socket_out(port_d, ip);
 	if(data_fd == -1) {
 		printf("failed to setup data trans connection with peer\n");
-		ptr->alive = PEER_DEAD;
-		return -1;
+		goto REP_ERROR;
 	}
 
 	//pre-alloc the file space
 	if(file_alloc(job->file_name, &(job->fd), job->size + PIECE_SIZE) == -1) {
 		printf("file pre-alloc space failed\n");
-		ptr->alive = PEER_DEAD;
-		return -1;
+		goto REP_ERROR;
 	}
 	
 	ptr->peer_filemap = (char *)calloc(job->map_len, sizeof(unsigned char));
@@ -514,6 +521,13 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 	ev_io_init(&(ptr->peer_transreq_io), trans_REQ_cb, data_fd, EV_WRITE);
 	ev_io_start(loop, &(ptr->peer_transrep_io));
 	ev_io_start(loop, &(ptr->peer_transreq_io));
+
+	return 0;
+
+REP_ERROR:
+	ev_fd_close(w);
+	ptr->alive = PEER_DEAD;
+	return -1;
 }
 
 void peerinfo_cb(EV_P_ ev_io *w, int events)
@@ -530,6 +544,11 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 		P2P_MSG_IN.len == 0) {
 		ev_fd_close(w);
 		return;
+	}
+
+	//TODO: handle error from peer. May need to remove this peer. unable to connect with the peer???
+	if(P2P_MSG_IN.error) {
+
 	}
 
 	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
@@ -698,6 +717,8 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 		if(find_peer(&(job->peer_list), peers[i].cid) == false)
 			init_peer_conn(EV_A_ peers[i], fid, job);
 	}
+
+	return 0;
 }
 
 void *assign_piece(void *arg)
@@ -726,6 +747,8 @@ void *assign_piece(void *arg)
 
 		
 		list_for_each_entry(ptr, &job->peer_list, list) {
+			if(ptr->alive == PEER_DEAD)
+				continue;
 			ptr->piece_queue->in = ptr->piece_queue->out = 0;
 			qsort(ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
 		}
@@ -737,6 +760,8 @@ void *assign_piece(void *arg)
 				continue;
 
 			list_for_each_entry(ptr, &job->peer_list, list) {
+				if(ptr->alive == PEER_DEAD)
+					continue;
 				//check if it is in the pending list
 				res = bsearch(&i, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
 				if(res) {
@@ -756,6 +781,8 @@ void *assign_piece(void *arg)
 		
 		//choke method
 		list_for_each_entry(ptr, &job->peer_list, list) {
+			if(ptr->alive == PEER_DEAD)
+				continue;
 		/* if we have got certain pieces and the peer is choked, then:
 		*	1. if the peer is choked because of pending list is full, reduce the assign queue len.
 		*	2. if the peer is choked beacuse of the assign queue is empty and the len of pending list is low, enlargethe queue len.
@@ -794,6 +821,8 @@ void *assign_piece(void *arg)
 		for(i=0; i<cur; i++) {
 			int flag = 0;
 			list_for_each_entry(ptr, &job->peer_list, list) {
+				if(ptr->alive == PEER_DEAD)
+					continue;
 				if(get_bit(ptr->peer_filemap, pc[i].index) && 
 					fifo_put(ptr->piece_queue, &pc[i]) == 0) {
 					flag = 1;
@@ -920,6 +949,10 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 		return;
 	}
 
+	if(P2P_MSG_IN.error) {
+	//TODO: handle error from server. file ID is wrong??? 
+	}
+
 	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
 		printf("unknown msg type\n");
 		return;
@@ -933,6 +966,25 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 //TODO: handle client conn req msg on peer listening port
 // send reply with: 1. file_id 2. peer ip 3. peer data trans port 4. file_bitmap
 // setup data trans socket on peer to wait client data trans req
+
+	ssize_t read;
+	int i;
+	size_t dlen = P2P_MSG_IN.len;
+	char data[dlen];
+	
+	read = socket_read(w->fd, data, dlen);
+	if(read == 0 || read == -1 || read != dlen) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+
+		printf("%s socket read error?\n", __func__);
+		goto CREQ_ERROR;
+	}
+
+CREQ_ERROR:
+	ev_fd_close(w);
+	_free(w);
+	return -1;
 }
 
 int client_keepalive_fn(EV_P_ ev_io *w)
@@ -953,7 +1005,9 @@ void peer_req_cb(EV_P_ ev_io *w, int events)
 		P2P_MSG_IN.magic != MAGIC_NUM ||
 		P2P_MSG_IN.cid != ID ||
 		P2P_MSG_IN.len == 0) {
-		ev_fd_close(w);
+		//this is client listening port... do not close it. just stop the watcher
+		ev_fd_close(w)
+		_free(w);
 		return;
 	}
 
@@ -1012,8 +1066,7 @@ void download_file(char *file_id)
 		init_var();
 
 		daemon(1, 1);
-
-		int clientCLI_fd;
+		
 		ev_io cli_io;
 		clientCLI_fd = open_unix_socket_in(UNIX_SOCK_PATH);
 		if(clientCLI_fd == -1)
@@ -1022,7 +1075,6 @@ void download_file(char *file_id)
 		ev_io_init(&cli_io, accept_cli_cb, clientCLI_fd, EV_READ);
 		ev_io_start(loop, &cli_io);
 
-		int client2srv_fd;
 		ev_io csrv_io;
 		client2srv_fd = open_socket_out(SERVER_PORT, SERVER_IP);
 		if(client2srv_fd == -1)
@@ -1031,7 +1083,6 @@ void download_file(char *file_id)
 		ev_io_init(&csrv_io, reply_server_cb, client2srv_fd, EV_READ);
 		ev_io_start(loop, &csrv_io);
 	
-		int p2p_listen_fd;
 		ev_io plisten_io;
 		p2p_listen_fd = open_socket_in(CLIENT_LISTEN_PORT, CLIENT_IP); 
 		if(p2p_listen_fd == -1)
