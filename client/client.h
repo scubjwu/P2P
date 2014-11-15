@@ -10,11 +10,11 @@
 #define PEER_DEAD				999
 #define DEFAULT_QUEUE_LEN		32
 #define FILE_NAME_LEN			256
-#define DOWNLOAD_THRESHOLD	64
-#define SHARE_RATE				10
+#define DOWNLOAD_THRESHOLD	128
+#define SHARE_RATE				20
 
 #define cli_cmd_header_len		(2 * sizeof(unsigned))
-#define msg_header_len	(sizeof(double) + 3 * sizeof(unsigned int) + sizeof(int))
+#define msg_header_len	(sizeof(double) + 3 * sizeof(unsigned int) + sizeof(size_t))
 
 struct cli_cmd_t {
 	unsigned type;
@@ -26,7 +26,7 @@ struct pmsg_t {
 	unsigned int magic;
 	unsigned int type;
 	unsigned int cid;
-	int len;
+	size_t len;
 	double version;
 	char content[DATA_LEN];
 };
@@ -66,6 +66,8 @@ struct peer_info_t {
 	size_t p_download;
 	//total pieces this peer has been loaded to the network = peer.job->c_upload
 	size_t p_upload;
+	//total pieces this peer has been trans to the client
+	size_t peer_trans_cnt;
 
 	ev_io peerinfo_io;
 	ev_io peer_transreq_io;

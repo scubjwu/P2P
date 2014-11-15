@@ -29,6 +29,7 @@ struct pmsg_t P2P_MSG_OUT;
 struct pmsg_t P2P_MSG_IN;
 struct list_head JOBS;
 char file_info[512];
+char wb_buff[PIECE_SIZE];
 
 extern int errno;
 
@@ -48,6 +49,14 @@ struct ev_loop *loop;
 	while((job)->piece_update == 1)			\
 		pthread_cond_wait(&(job)->assign_rep, &(job)->assign_lock);		\
 	pthread_mutex_unlock(&(job)->assign_lock);		\
+}
+
+#define queue_shrank(fifo)			\
+{								\
+	(fifo)->size = (fifo)->size / 2;	\
+	if((fifo)->size < 4)				\
+		(fifo)->size = 4;			\
+	fifo = fifo_realloc(fifo, (fifo)->size);	\
 }
 
 int file_check_fn(EV_P_ ev_io *w);
@@ -261,7 +270,7 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	struct download_job_t *job = ptr->job;
 	
 	ssize_t read;
-	int dlen = P2P_MSG_IN.len;
+	size_t dlen = P2P_MSG_IN.len;
 	char data[dlen];
 	read = socket_read(w->fd, data, dlen);
 	if(read == 0 || read == -1 || read != dlen) {
@@ -302,7 +311,7 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	size_t len = MD5_LEN + sizeof(off_t) + sizeof(unsigned int);
 	memcpy(file_info + len, job->file_map, job->map_len);
 	len += job->map_len;
-	if(fileinfo_wb(job->fd, file_info, len, job->size) != len) {
+	if(file_write(job->fd, file_info, len, job->size + 0x400/*1KB safe space*/) != len) {
 		printf("file info write back error. (%s)\n", strerror(errno));
 		ptr->alive = PEER_DEAD;
 		return -1;
@@ -311,7 +320,7 @@ int peer_keepalive_fn(EV_P_ ev_io *w)
 	return 0;
 }
 
-void trans_REQ(EV_P_ ev_io *w, int events)
+void trans_REQ_cb(EV_P_ ev_io *w, int events)
 {
 // send data req to peer. put the req into pending list.
 // 1. file_id 2. piece_id
@@ -331,6 +340,7 @@ void trans_REQ(EV_P_ ev_io *w, int events)
 	fifo_get(ptr->piece_queue, &tmp);
 
 	P2P_MSG_OUT.type = 0x07;
+	P2P_MSG_OUT.cid = ptr->peer_id;
 	P2P_MSG_OUT.len = MD5_LEN + sizeof(off_t);
 	char *buf = P2P_MSG_OUT.content;
 	
@@ -350,10 +360,100 @@ void trans_REQ(EV_P_ ev_io *w, int events)
 	ptr->plist_cur++;
 }
 
-void trans_REP(EV_P_ ev_io *w, int events)
+void trans_REP_cb(EV_P_ ev_io *w, int events)
 {
-//TODO: do the actual file trans. recv the tran reply from peer and write back data to file
-// check if the sending queue is choked
+// do the actual file trans. recv the tran reply from peer and write back data to file
+// check if the sending queue is choked after finish wb
+
+	struct peer_info_t *ptr;
+	ptr = container_of(w, struct peer_info_t, peer_transrep_io);
+
+	struct download_job_t *job = ptr->job;
+
+	ssize_t read;
+	size_t len = msg_header_len + MD5_LEN + sizeof(off_t);
+	read = socket_read(w->fd, (char *)&P2P_MSG_IN, len);
+	if(read != len ||
+		P2P_MSG_IN.magic != MAGIC_NUM ||
+		P2P_MSG_IN.cid != ID ||
+		P2P_MSG_IN.len == 0) {
+		printf("trans rep msg error\n");
+		return;
+	}
+
+	char file_id[MD5_LEN] = {0};
+	memcpy(file_id, P2P_MSG_IN.content, MD5_LEN);
+
+	off_t piece_id;
+	memcpy(&piece_id, P2P_MSG_IN.content + MD5_LEN, sizeof(off_t));
+
+	if(strcmp(file_id, job->file_id)) {
+		printf("wrong file_id of trans rep\n");
+		ptr->alive = PEER_DEAD;
+		return;
+	}
+
+	qsort(ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
+	off_t *pos;
+	pos = bsearch(&piece_id, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
+	if(pos == NULL) {
+		printf("wrong file piece of trans rep\n");
+		ptr->alive = PEER_DEAD;
+		return;
+	}
+
+	len = P2P_MSG_IN.len - MD5_LEN - sizeof(off_t);	//actual data len
+	if(len > PIECE_SIZE) {
+		printf("wrong data len of trans rep\n");
+		ptr->alive = PEER_DEAD;
+		return;
+	}
+
+	read = socket_read(w->fd, wb_buff, len);
+	if(read == 0 || read == -1 || read != len) {
+		if(read == -1)
+			printf("socket read error: %s\n", strerror(errno));
+
+		printf("%s error?\n", __func__);
+		ptr->alive = PEER_DEAD;
+		return;
+	}
+
+	if(write_p2pfile(ptr, piece_id, len) == -1) {
+		printf("write back file error?\n");
+		ptr->alive = PEER_DEAD;
+		return;
+	}
+
+	//update related info
+	*pos = -1;
+	ptr->plist_cur--;
+	ptr->peer_trans_cnt++;
+	job->c_download++;
+	
+	if(ptr->choke && !FIFO_EMPTY(ptr->piece_queue)) {
+		ptr->choke = 0;
+		ev_io_start(loop, &ptr->peer_transreq_io);
+	}
+}
+
+int write_p2pfile(struct peer_info_t *peer, off_t pos, size_t len)
+{
+	unsigned char *bitmap = peer->job->file_map;
+	size_t p_num = peer->job->map_len * 8;
+
+	if(get_bit(bitmap, pos) == 1 ||
+		pos >= p_num ||
+		(pos != p_num - 1 && len != PIECE_SIZE))
+		return -1;
+
+	if(file_write(peer->job->fd, wb_buff, len, pos * PIECE_SIZE) != len)
+		return -1;
+
+	//update file map
+	set_bit_true(bitmap, pos);
+
+	return 0;
 }
 
 int peer_conn_rep_fn(EV_P_ ev_io *w)
@@ -361,7 +461,7 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 //handle peer conn reply msg on client listening port
 // 1. file_id 2. peer ip 3. peer port 4. file_bitmap 
 	ssize_t read;
-	int dlen = P2P_MSG_IN.len;
+	size_t dlen = P2P_MSG_IN.len;
 	char data[dlen];
 	read = socket_read(w->fd, data, dlen);
 	if(read == 0 || read == -1 || read != dlen) {
@@ -410,8 +510,8 @@ int peer_conn_rep_fn(EV_P_ ev_io *w)
 	strcpy(ptr->peer_filemap, file_map);
 	filemap_update_req(job);
 
-	ev_io_init(&(ptr->peer_transrep_io), trans_REP, data_fd, EV_READ);
-	ev_io_init(&(ptr->peer_transreq_io), trans_REQ, data_fd, EV_WRITE);
+	ev_io_init(&(ptr->peer_transrep_io), trans_REP_cb, data_fd, EV_READ);
+	ev_io_init(&(ptr->peer_transreq_io), trans_REQ_cb, data_fd, EV_WRITE);
 	ev_io_start(loop, &(ptr->peer_transrep_io));
 	ev_io_start(loop, &(ptr->peer_transreq_io));
 }
@@ -440,10 +540,11 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 	msg_fns[P2P_MSG_IN.type].func(EV_A_ w);
 }
 
-void build_peerinfo_msg(unsigned int type, char *fid, unsigned char *file_map, size_t download, size_t upload)
+void build_peerinfo_msg(unsigned int type, unsigned int id, char *fid, unsigned char *file_map, size_t download, size_t upload)
 {
 	int map_len = strlen(file_map);
 	P2P_MSG_OUT.type = type;
+	P2P_MSG_OUT.cid = id;
 	P2P_MSG_OUT.len = MD5_LEN + 2 * sizeof(size_t) + map_len;
 
 	char *p = P2P_MSG_OUT.content;
@@ -465,7 +566,7 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 	}
 
 	ptr->alive++;
-	build_peerinfo_msg(0x05, job->file_id, job->file_map, job->c_download, job->c_upload);
+	build_peerinfo_msg(0x05, ptr->peer_id, job->file_id, job->file_map, job->c_download, job->c_upload);
 	if(socket_write(ptr->peerinfo_io.fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
 		ev_fd_close(&(ptr->peerinfo_io));
 		return;
@@ -490,11 +591,12 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 	ptr->alive = 0;
 	ptr->p_download = 0;
 	ptr->p_upload = 0;
+	ptr->peer_trans_cnt = 0;
 	
 	ev_io_init(&(ptr->peerinfo_io), peerinfo_cb, peerinfo_fd, EV_READ);
 	ev_io_start(loop, &(ptr->peerinfo_io));
 
-	build_peerinfo_msg(0x03, fid, job->file_map, job->c_download, job->c_upload);
+	build_peerinfo_msg(0x03,ptr->peer_id,  fid, job->file_map, job->c_download, job->c_upload);
 	if(socket_write(peerinfo_fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len) <= 0) {
 		perror("failed to make connection with peer.\n");
 		ev_fd_close(&(ptr->peerinfo_io));
@@ -508,7 +610,7 @@ void init_peer_conn(EV_P_ struct peer_list_t peer, char *fid, struct download_jo
 	ptr->piece_queue = fifo_alloc(DEFAULT_QUEUE_LEN);
 	ptr->plist_len = 2 * DEFAULT_QUEUE_LEN;
 	ptr->plist_cur = 0;
-	ptr->pending_list = (off_t *)malloc(2 * DEFAULT_QUEUE_LEN * sizeof(off_t));
+	ptr->pending_list = (off_t *)malloc(DEFAULT_QUEUE_LEN * sizeof(off_t));
 	for(i=0; i<2 * DEFAULT_QUEUE_LEN; i++)
 		ptr->pending_list[i] = -1;
 	
@@ -558,7 +660,7 @@ bool find_peer(struct list_head *plist, unsigned int id)
 int server_keepalive_fn(EV_P_ ev_io *w)
 {
 	ssize_t read;
-	int dlen = P2P_MSG_IN.len;
+	size_t dlen = P2P_MSG_IN.len;
 	int peer_num = (dlen - MD5_LEN) / sizeof(struct peer_list_t);
 
 	char data[dlen];
@@ -654,28 +756,37 @@ void *assign_piece(void *arg)
 		
 		//choke method
 		list_for_each_entry(ptr, &job->peer_list, list) {
-			if(ptr->choke && ptr->p_download > DOWNLOAD_THRESHOLD) {
+		/* if we have got certain pieces and the peer is choked, then:
+		*	1. if the peer is choked because of pending list is full, reduce the assign queue len.
+		*	2. if the peer is choked beacuse of the assign queue is empty and the len of pending list is low, enlargethe queue len.
+		*/
+			if(ptr->choke && job->c_download > DOWNLOAD_THRESHOLD) {
 				if(ptr->plist_len == ptr->plist_cur) {
-					ptr->piece_queue->size = ptr->piece_queue->size / 2;
-					if(ptr->piece_queue->size < 4)
-						ptr->piece_queue->size = 4;
-					
-					ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size);
+					queue_shrank(ptr->piece_queue);
 				}
-				else if(FIFO_EMPTY(ptr->piece_queue)) {
+				else if(FIFO_EMPTY(ptr->piece_queue) 
+					&& ptr->plist_cur < DEFAULT_QUEUE_LEN/2) {
 					ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size + 4);
 					ptr->choke = 0;
 					ev_io_start(loop, &ptr->peer_transreq_io);
 				}
 			}
 
+			/* if the peer has been lived for a certain time and its share rate is low, 
+			*	then reduce the assign queue len.
+			*/
 			if(ptr->p_download > average_p
 				&& ptr->p_download / ptr->p_upload > SHARE_RATE) {
-				ptr->piece_queue->size = ptr->piece_queue->size / 2;
-				if(ptr->piece_queue->size < 4)
-					ptr->piece_queue->size = 4;
-					
-				ptr->piece_queue = fifo_realloc(ptr->piece_queue, ptr->piece_queue->size);
+				queue_shrank(ptr->piece_queue);
+			}
+
+			/* if both of the client and the peer have been lived for a certain time but the total trans piece from the peer
+			*	is low, then reduce the assign queue
+			*/
+			if(job->c_download > average_p && 
+				ptr->p_download > average_p &&
+				ptr->peer_trans_cnt < DEFAULT_QUEUE_LEN) {
+				queue_shrank(ptr->piece_queue);
 			}
 		}
 		
@@ -737,7 +848,7 @@ int file_check_fn(EV_P_ ev_io *w)
 {
 	ssize_t read;
 	int i;
-	int dlen = P2P_MSG_IN.len;
+	size_t dlen = P2P_MSG_IN.len;
 	int peer_num = (dlen - MD5_LEN - sizeof(unsigned int) - sizeof(off_t) - FILE_NAME_LEN) 
 					/ sizeof(struct peer_list_t);
 	if(peer_num < 0) {

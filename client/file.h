@@ -18,7 +18,7 @@ off_t file_size(FILE *f);
 space_t available_space(const char *path);
 int file_alloc(char *name, int *fd, off_t size);
 unsigned int bitcount(unsigned char c);
-ssize_t fileinfo_wb(int fd, const void *buf, size_t count, off_t off);
+ssize_t file_write(int fd, const void *buf, size_t count, off_t off);
 ssize_t file_read(int fd, void *buf, size_t count, off_t off);
 
 #endif

@@ -70,25 +70,26 @@ space_t available_space(const char *path)
 
 int file_alloc(char *name, int *fd, off_t size)
 {
-	int f;
+	FILE *f;
 	char path[512] = {0};
 	sprintf(path, "%s/%s_p2p.tmp", SHARE_DIR, name);
-	f = open(path, O_CREAT | O_RDWR);
-	if(f == -1) {
+	f = fopen(path, "w+");
+	if(f == NULL) {
 		perror("open file error");
 		return -1;
 	}
 
-	if(ftruncate(f, size) == -1) {
+	*fd = fileno(f);
+	if(ftruncate(*fd, size) == -1) {
 		perror("ftruncate");
+		*fd = 0;
 		return -1;
 	}
-
-	*fd = f;
+	
 	return 0;
 }
 
-ssize_t fileinfo_wb(int fd, const void *buf, size_t count, off_t off)
+ssize_t file_write(int fd, const void *buf, size_t count, off_t off)
 {
 	ssize_t ret;
 
