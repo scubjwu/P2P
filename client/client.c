@@ -637,8 +637,17 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 	struct download_job_t *job = ptr->job;
 
 	if(ptr->alive > KEEPALIVE_TIMEOUT) {
-//TODO: if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we need to remove this peer	
-		
+//if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we simplely remove this peer	
+		_free(ptr->peer_filemap);
+		_free(ptr->pending_list);
+		fifo_free(ptr->piece_queue, 0);
+		ev_fd_close(&ptr->peerinfo_io);
+		ev_fd_close(&ptr->peer_transrep_io);
+		ev_fd_close(&ptr->peer_transreq_io);
+		ev_timer_stop(loop, &ptr->peerinfo_timer);
+
+		list_del(&ptr->list);
+		return;
 	}
 
 	ptr->alive++;
