@@ -5,6 +5,7 @@
 #include "file.h"
 
 extern char SHARE_DIR[256];
+extern int errno;
 
 struct _byte {
 	unsigned a1 : 1;
@@ -16,6 +17,34 @@ struct _byte {
 	unsigned a7 : 1;
 	unsigned a8 : 1;
 };
+
+unsigned int bitcount(unsigned char c)
+{
+	struct _byte *tmp = (struct _byte *)&c;
+	return (tmp->a1 + tmp->a2 + tmp->a3 + tmp->a4 + tmp->a5 + tmp->a6 + tmp->a7 + tmp->a8);
+}
+
+ssize_t file_write(int fd, const void *buf, size_t count, off_t off)
+{
+	ssize_t ret;
+
+	do {
+		ret = pwrite(fd, buf, count, off);
+	} while (ret == -1 && errno == EINTR);
+	
+	return ret;
+}
+
+ssize_t file_read(int fd, void *buf, size_t count, off_t off)
+{
+	ssize_t ret;
+
+	do {
+		ret = pread(fd, buf, count, off);
+	} while (ret == -1 && errno == EINTR);
+	
+	return ret;
+}
 
 void chunk_md5(unsigned char *data, unsigned long len, unsigned char *res)
 {
@@ -29,16 +58,16 @@ void chunk_md5(unsigned char *data, unsigned long len, unsigned char *res)
 	memcpy(res, c, MD5_DIGEST_LENGTH * sizeof(unsigned char));
 }
 
-void file_md5(FILE *f, unsigned char *res)
+void file_md5(int fd, unsigned char *res)
 {
 	unsigned char c[MD5_DIGEST_LENGTH];
 	unsigned char buf[DATA_LEN];
 	MD5_CTX mdContext;
-	size_t read;
+	size_t cnt;
 
 	MD5_Init(&mdContext);
-	while((read = fread(buf, sizeof(unsigned char), DATA_LEN, f)) != 0)
-		MD5_Update(&mdContext, buf, read);
+	while((cnt = read(fd, buf, sizeof(unsigned char) * DATA_LEN)) != 0)
+		MD5_Update(&mdContext, buf, cnt);
 	MD5_Final(c, &mdContext);
 
 	memcpy(res, c, MD5_DIGEST_LENGTH * sizeof(unsigned char));
@@ -89,34 +118,6 @@ int file_alloc(char *name, int *fd, off_t size)
 	return 0;
 }
 
-ssize_t file_write(int fd, const void *buf, size_t count, off_t off)
-{
-	ssize_t ret;
-
-	do {
-		ret = pwrite(fd, buf, count, off);
-	} while (ret == -1 && errno == EINTR);
-	
-	return ret;
-}
-
-ssize_t file_read(int fd, void *buf, size_t count, off_t off)
-{
-	ssize_t ret;
-
-	do {
-		ret = pread(fd, buf, count, off);
-	} while (ret == -1 && errno == EINTR);
-	
-	return ret;
-}
-
-unsigned int bitcount(unsigned char c)
-{
-	struct _byte *tmp = (struct _byte *)&c;
-	return (tmp->a1 + tmp->a2 + tmp->a3 + tmp->a4 + tmp->a5 + tmp->a6 + tmp->a7 + tmp->a8);
-}
-
 /*
 void set_bit_true(unsigned char *bitmap, unsigned int pos)
 {
@@ -139,7 +140,7 @@ int main(void)
 	FILE *f = fopen("./c.txt", "r");
 	unsigned char md5[MD5_DIGEST_LENGTH];
 	int i;
-	file_md5(f, md5);
+	file_md5(fileno(f), md5);
 
 	for(i=0; i<MD5_DIGEST_LENGTH; i++)
 		printf("%02x", md5[i]);

@@ -77,14 +77,13 @@ struct msg_handle_fn {
 }
 msg_fns[7] = {
 
-/*0x00*/		{NULL, NULL},
+/*0x00*/		{NULL, NULL},		//this leaves for error msg handler
 /*0x01*/		{"filecheck", file_check_fn},
 /*0x02*/		{"srvkeepalive", server_keepalive_fn},
 /*0x03*/		{"connreq", client_conn_req_fn},
 /*0x04*/		{"connrep", peer_conn_rep_fn},
 /*0x05*/		{"clientkeepalive", client_keepalive_fn},
 /*0x06*/		{"peerkeepalive", peer_keepalive_fn}
-//TODO:
 };
 
 static int piece_cmp(const void *n1, const void *n2)
@@ -162,6 +161,21 @@ void load_config_file(char *file)
 	port_range = (char *)calloc(MAX_TRANS_PORT - MIN_TRANS_PORT, sizeof(char));
 
 	printf("%d %d %d %d %s %s %s\n", CLIENT_LISTEN_PORT, MIN_TRANS_PORT, MAX_TRANS_PORT, INTERFACE_ID, SERVER_IP, CLIENT_IP, SHARE_DIR);
+}
+
+void send_error_msg(int fd, int error, char *content)
+{
+	P2P_MSG_OUT.pid = P2P_MSG_IN.cid;
+	P2P_MSG_OUT.type = 0x0;
+	P2P_MSG_OUT.error = error;
+	if(content) {
+		P2P_MSG_OUT.len = strlen(content);
+		memcpy(P2P_MSG_OUT.content, content, P2P_MSG_OUT.len);
+	}
+	else
+		P2P_MSG_OUT.len = 0;
+
+	socket_write(fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len);
 }
 
 void exit_save(void)
@@ -438,6 +452,7 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 
 	if(P2P_MSG_IN.error) {
 	//TODO: handle error of trans req from peer
+	
 	}
 
 	char file_id[MD5_LEN] = {0};
@@ -629,6 +644,20 @@ void build_peerinfo_msg(unsigned int type, unsigned int id, char *fid, unsigned 
 	memcpy(p + MD5_LEN + 2 * sizeof(size_t), file_map, map_len);
 }
 
+void peer_remove(struct peer_info_t *ptr)
+{
+	_free(ptr->peer_filemap);
+	_free(ptr->pending_list);
+	fifo_free(ptr->piece_queue, 0);
+	ev_fd_close(&ptr->peerinfo_io);
+	ev_fd_close(&ptr->peer_transrep_io);
+	ev_fd_close(&ptr->peer_transreq_io);
+	ev_timer_stop(loop, &ptr->peerinfo_timer);
+
+	list_del(&ptr->list);
+	_free(ptr);
+}
+
 void peer_keepalive(EV_P_ ev_timer *w, int events)
 {
 //send keepalive msg to peer
@@ -638,15 +667,7 @@ void peer_keepalive(EV_P_ ev_timer *w, int events)
 
 	if(ptr->alive > KEEPALIVE_TIMEOUT) {
 //if the value of ptr->alive is higher than KEEPALIVE_TIMEOUT, we simplely remove this peer	
-		_free(ptr->peer_filemap);
-		_free(ptr->pending_list);
-		fifo_free(ptr->piece_queue, 0);
-		ev_fd_close(&ptr->peerinfo_io);
-		ev_fd_close(&ptr->peer_transrep_io);
-		ev_fd_close(&ptr->peer_transreq_io);
-		ev_timer_stop(loop, &ptr->peerinfo_timer);
-
-		list_del(&ptr->list);
+		peer_remove(ptr);
 		return;
 	}
 
@@ -788,6 +809,50 @@ int server_keepalive_fn(EV_P_ ev_io *w)
 	return 0;
 }
 
+int download_check(struct download_job_t *job)
+{
+	char oldpath[512] = {0};
+	char newpath[512] = {0};
+	unsigned char md5[MD5_LEN];
+
+	//resize the file
+	if(ftruncate(job->fd, job->size) == -1) {
+		printf("finish downloading. Error on resize the file (%s)\n", strerror(errno));
+		return -1;
+	}
+
+	//rename the file
+	sprintf(oldpath, "%s/%s_p2p.tmp", SHARE_DIR, job->file_name);
+	sprintf(newpath, "%s/%s", SHARE_DIR, job->file_name);
+	if(rename(oldpath, newpath) == -1) {
+		printf("finish downloading. Error on rename the file (%s)\n", strerror(errno));
+		return -1;
+	}
+
+	//check file MD5
+	file_md5(job->fd, md5);
+	if(strcmp(md5, job->file_id)) {
+		printf("file MD5 checksum error\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+void job_stop(struct download_job_t *job)
+{
+	_free(job->file_map);
+	_free(job->pc);
+
+	struct peer_info_t *ptr;
+	list_for_each_entry(ptr, &job->peer_list, list) {
+		peer_remove(ptr);
+	}
+
+	list_del(&job->list);
+	_free(job);
+}
+
 void *assign_piece(void *arg)
 {
 	pthread_detach(pthread_self());
@@ -847,7 +912,14 @@ void *assign_piece(void *arg)
 			cur++;
 		}
 		if(finished == 1) {
-		//TODO: job finished....
+		//job finished....
+			if(download_check(job) == -1)
+				printf("%s download failed\n", job->file_name);
+			else
+				printf("%s download ok\n", job->file_name);
+
+			job_stop(job);
+			pthread_exit(NULL);
 		}
 		
 		qsort(job->pc, cur, sizeof(struct piece_info_t), piece_cmp);
@@ -1032,6 +1104,7 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 
 	if(P2P_MSG_IN.error) {
 	//TODO: handle error from server. file ID is wrong??? 
+	
 	}
 
 	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
@@ -1082,8 +1155,8 @@ void data_send_cb(EV_P_ ev_io *w, int events)
 		P2P_MSG_IN.magic != MAGIC_NUM ||
 		P2P_MSG_IN.pid != ID) {
 		printf("peer read trans req msg error\n");
-		//TODO: send error msg back to client
-
+		//send error msg back to client. 0x01 - illegal msg header
+		send_error_msg(w->fd, 0x01/*error type*/, NULL);
 		goto SEND_ERROR;
 	}
 	
@@ -1092,22 +1165,22 @@ void data_send_cb(EV_P_ ev_io *w, int events)
 
 	job = find_job(file_id);
 	if(job == NULL) {
-	//TODO: send error msg back to client
-
+	//send error msg back to client. 0x02 - no such file for share
+		send_error_msg(w->fd, 0x02/*error type*/, NULL);
 		goto SEND_ERROR;
 	}
 
 	piece_size = get_piece_size(job->file_map, job->size, piece_id);
 	if(piece_size == 0) {
-	//TODO: error piece size. send back error msg
-
+	//0x03 - error piece size. send back error msg
+		send_error_msg(w->fd, 0x03/*error type*/, NULL);
 		goto SEND_ERROR;
 	}
 
 	if(file_read(job->fd, wb_buff + msg_header_len + MD5_LEN + sizeof(off_t), 
 				piece_size, piece_id) != piece_size) {
-	//TODO: file read error. send back error msg
-
+	//0x04 - peer reads file error. send back error msg
+		send_error_msg(w->fd, 0x04/*error type*/, NULL);
 		goto SEND_ERROR;
 	}
 
@@ -1139,7 +1212,6 @@ void accept_datareq_cb(EV_P_ ev_io *w, int events)
 		errno != EAGAIN &&
 		errno != EWOULDBLOCK) {
 		printf("peer accept error: %s\n", strerror(errno));
-		//TODO: send back accept error msg to client???
 		goto ACPT_END;
 	}
 
@@ -1176,8 +1248,8 @@ int client_keepalive_fn(EV_P_ ev_io *w)
 
 	job = find_job(file_id);
 	if(job == NULL) {
-	//TODO: construct error msg and send back to client
-	
+	//send error msg back to client. 0x02 - no such file for share
+		send_error_msg(w->fd, 0x02, NULL);
 		goto CKEEPALIVE_END;
 	}
 
@@ -1226,8 +1298,8 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 
 	job = find_job(file_id);
 	if(job == NULL) {
-	//TODO: construct error msg and send back to client
-	
+	//construct error msg and send back to client. 0x02 - no such file for share
+		send_error_msg(w->fd, 0x02, NULL);
 		ev_fd_close(w);
 		_free(w);
 		return -1;
@@ -1239,8 +1311,8 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 	//assign a random port for data trans
 	port = datatrans_port();
 	if(port == 0) {
-	//TODO: send error back. no port available on peer for data trans...
-
+	//send error back. 0x05 - socket setup error on peer
+		send_error_msg(w->fd, 0x05, NULL);
 		ev_fd_close(w);
 		_free(w);
 		return -1;
@@ -1250,8 +1322,8 @@ int client_conn_req_fn(EV_P_ ev_io *w)
 	int data_fd;
 	data_fd = open_socket_in(port, CLIENT_IP); 
 	if(data_fd == -1) {
-	//TODO: setup recv socket error. send back error msg
-
+	//setup recv socket error. send back error msg. 0x05 - socket setup error on peer
+		send_error_msg(w->fd, 0x05, NULL);
 		ev_fd_close(w);
 		_free(w);
 		return -1;
