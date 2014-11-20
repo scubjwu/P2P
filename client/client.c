@@ -86,6 +86,15 @@ msg_fns[7] = {
 /*0x06*/		{"peerkeepalive", peer_keepalive_fn}
 };
 
+static char *error_msg_str[6] = {
+	"ok"
+	"illegal header",
+	"no such file to share",
+	"error piece id"
+	"peer error on transfering file",
+	"peer error on setup data transmission socket"
+};
+
 static int piece_cmp(const void *n1, const void *n2)
 {
 	return (((struct piece_info_t *)n1)->count - ((struct piece_info_t *)n2)->count);
@@ -176,6 +185,12 @@ void send_error_msg(int fd, int error, char *content)
 		P2P_MSG_OUT.len = 0;
 
 	socket_write(fd, (char *)&P2P_MSG_OUT, msg_header_len + P2P_MSG_OUT.len);
+}
+
+void handle_error(EV_P_ ev_io *w, int error)
+{
+	printf("P2P ERROR: %s\n", error_msg_str[error]);
+	ev_fd_close(w);
 }
 
 void exit_save(void)
@@ -426,7 +441,6 @@ void trans_REQ_cb(EV_P_ ev_io *w, int events)
 	pos = bsearch(&key, ptr->pending_list, ptr->plist_len, sizeof(off_t), offset_cmp);
 	*pos = ((struct piece_info_t *)tmp)->index;
 	ptr->plist_cur++;
-	return;
 }
 
 void trans_REP_cb(EV_P_ ev_io *w, int events)
@@ -451,8 +465,10 @@ void trans_REP_cb(EV_P_ ev_io *w, int events)
 	}
 
 	if(P2P_MSG_IN.error) {
-	//TODO: handle error of trans req from peer
-	
+	//handle error of trans req from peer
+		handle_error(EV_A_ w, P2P_MSG_IN.error);
+		ptr->alive = PEER_DEAD;
+		return;
 	}
 
 	char file_id[MD5_LEN] = {0};
@@ -617,9 +633,10 @@ void peerinfo_cb(EV_P_ ev_io *w, int events)
 		return;
 	}
 
-	//TODO: handle error from peer. May need to remove this peer. unable to connect with the peer???
+	//handle error from peer. May need to remove this peer. unable to connect with the peer???
 	if(P2P_MSG_IN.error) {
-
+		handle_error(EV_A_ w, P2P_MSG_IN.error);
+		return;
 	}
 
 	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
@@ -1103,8 +1120,9 @@ void reply_server_cb(EV_P_ ev_io *w, int events)
 	}
 
 	if(P2P_MSG_IN.error) {
-	//TODO: handle error from server. file ID is wrong??? 
-	
+	//handle error from server. file ID is wrong??? 
+		printf("SERVER ERROR: %s\n", error_msg_str[P2P_MSG_IN.error]);
+		return;
 	}
 
 	if(msg_fns[P2P_MSG_IN.type].func == NULL) {
@@ -1172,7 +1190,7 @@ void data_send_cb(EV_P_ ev_io *w, int events)
 
 	piece_size = get_piece_size(job->file_map, job->size, piece_id);
 	if(piece_size == 0) {
-	//0x03 - error piece size. send back error msg
+	//0x03 - error piece id. send back error msg
 		send_error_msg(w->fd, 0x03/*error type*/, NULL);
 		goto SEND_ERROR;
 	}
